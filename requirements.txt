@@ -1,4 +1,3 @@
 streamlit
 requests
-hashlib
-arcticspas
+arcticspas==2.0
