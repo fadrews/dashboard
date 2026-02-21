@@ -43,28 +43,6 @@ except Exception:
     ARCTICSPAS_INSTALLED = False
 
 @st.cache_resource
-def _get_spa_client_from_secrets() -> Optional[Any]:
-    """
-    Create and cache an arcticspas Client using st.secrets["arcticspa"].
-    Returns None if package missing, token missing, or client creation fails.
-    """
-    if not ARCTICSPAS_INSTALLED:
-        return None
-    try:
-        from arcticspas import Client  # local import to avoid hard failure at module import
-    except Exception:
-        return None
-    try:
-        secrets = st.secrets.get("arcticspa", {}) or {}
-        token = secrets.get("token")
-        base_url = secrets.get("base_url", ARCTIC_BASE)  # ARCTIC_BASE defined later; ok at call time
-        if not token:
-            return None
-        client = Client(base_url=base_url, headers={"X-API-KEY": token})
-        return client
-    except Exception:
-        return None
-
 def fetch_spa_status_via_service() -> Dict[str, Any]:
     """
     Uses cached client and generated client's spa status operation.
@@ -112,16 +90,75 @@ def fetch_spa_status_via_service() -> Dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 
-# Control helpers (examples). These attempt to import the likely modules and call sync_detailed.
-# Adjust body field names if your API expects different shapes.
-def _call_temperature_set(client, spa_id: str, temperature_c: float) -> Dict[str, Any]:
+def fetch_spa_status_via_service() -> Dict[str, Any]:
+    """
+    Create a fresh Client for this call using config from st.secrets.
+    Returns dict: {ok, status_code, data, error}
+    """
+    cfg = _get_spa_config_from_secrets()
+    if cfg is None:
+        if not ARCTICSPAS_INSTALLED:
+            return {"ok": False, "status_code": None, "data": None, "error": "arcticspas package not installed"}
+        return {"ok": False, "status_code": None, "data": None, "error": "Client config or token unavailable (check st.secrets['arcticspa'])"}
+
+    # import spa op lazily
     try:
-        from arcticspas.api import v2_temperature  # may raise
+        from arcticspas.api.spa_control import v2_spa
+    except Exception:
+        try:
+            from arcticspas.operations import v2_spa  # fallback
+        except Exception as exc:
+            return {"ok": False, "status_code": None, "data": None, "error": f"Could not import spa operation: {exc}"}
+
+    # create fresh client for this call
+    try:
+        from arcticspas import Client
+        client = Client(base_url=cfg["base_url"], headers={"X-API-KEY": cfg["token"]})
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": f"Failed to construct client: {exc}"}
+
+    try:
+        with client as c:
+            resp = v2_spa.sync_detailed(client=c)
+            status_code = getattr(resp, "status_code", None)
+            parsed = getattr(resp, "parsed", None)
+            data = None
+            if parsed is None:
+                try:
+                    data = resp.json()  # type: ignore
+                except Exception:
+                    data = None
+            else:
+                try:
+                    data = parsed.to_dict()
+                except Exception:
+                    try:
+                        data = json.loads(json.dumps(parsed, default=lambda o: getattr(o, "__dict__", str(o))))
+                    except Exception:
+                        data = parsed
+            ok = 200 <= (status_code or 0) < 400
+            return {"ok": ok, "status_code": status_code, "data": data, "error": None if ok else f"HTTP {status_code}"}
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
+
+    
+def _call_temperature_set(spa_id: str, temperature_c: float) -> Dict[str, Any]:
+    cfg = _get_spa_config_from_secrets()
+    if cfg is None:
+        return {"ok": False, "error": "Client config/token missing"}
+    try:
+        from arcticspas.api import v2_temperature
     except Exception:
         try:
             from arcticspas.operations import v2_temperature  # type: ignore
         except Exception as exc:
             return {"ok": False, "error": f"temperature op import failed: {exc}"}
+    try:
+        from arcticspas import Client
+        client = Client(base_url=cfg["base_url"], headers={"X-API-KEY": cfg["token"]})
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to create client: {exc}"}
+
     try:
         with client as c:
             body = {"target_temperature_c": temperature_c}
@@ -133,14 +170,24 @@ def _call_temperature_set(client, spa_id: str, temperature_c: float) -> Dict[str
     except Exception as exc:
         return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 
-def _call_light_set(client, spa_id: str, light_id: str, on: bool) -> Dict[str, Any]:
+
+def _call_light_set(spa_id: str, light_id: str, on: bool) -> Dict[str, Any]:
+    cfg = _get_spa_config_from_secrets()
+    if cfg is None:
+        return {"ok": False, "error": "Client config/token missing"}
     try:
-        from arcticspas.api import v2_light  # may raise
+        from arcticspas.api import v2_light
     except Exception:
         try:
             from arcticspas.operations import v2_light  # type: ignore
         except Exception as exc:
             return {"ok": False, "error": f"light op import failed: {exc}"}
+    try:
+        from arcticspas import Client
+        client = Client(base_url=cfg["base_url"], headers={"X-API-KEY": cfg["token"]})
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to create client: {exc}"}
+
     try:
         with client as c:
             body = {"state": "on" if on else "off"}
@@ -152,14 +199,24 @@ def _call_light_set(client, spa_id: str, light_id: str, on: bool) -> Dict[str, A
     except Exception as exc:
         return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 
-def _call_pump_set(client, spa_id: str, pump_id: str, speed: int) -> Dict[str, Any]:
+
+def _call_pump_set(spa_id: str, pump_id: str, speed: int) -> Dict[str, Any]:
+    cfg = _get_spa_config_from_secrets()
+    if cfg is None:
+        return {"ok": False, "error": "Client config/token missing"}
     try:
-        from arcticspas.api import v2_pump  # may raise
+        from arcticspas.api import v2_pump
     except Exception:
         try:
             from arcticspas.operations import v2_pump  # type: ignore
         except Exception as exc:
             return {"ok": False, "error": f"pump op import failed: {exc}"}
+    try:
+        from arcticspas import Client
+        client = Client(base_url=cfg["base_url"], headers={"X-API-KEY": cfg["token"]})
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to create client: {exc}"}
+
     try:
         with client as c:
             body = {"speed": speed}
@@ -181,6 +238,73 @@ ENPHASE_PUBLIC_URL = "https://enlighten.enphaseenergy.com/mobile/HRDg1683634/his
 ARCTIC_BASE = "https://api.myarcticspa.com"
 ARCTIC_SPA_PORTAL_HINT = "https://myarcticspa.com/spa/SpaAPIManagement.aspx"
 
+# Arctic secrets/config + service helpers — place BEFORE any code that uses them
+@st.cache_resource
+def _get_spa_config_from_secrets() -> Optional[Dict[str, str]]:
+    """
+    Return {'token': ..., 'base_url': ...} or None.
+    Cached to avoid repeated st.secrets access, but does NOT cache a Client object.
+    """
+    try:
+        secrets = st.secrets.get("arcticspa", {}) or {}
+        token = secrets.get("token")
+        base_url = secrets.get("base_url", ARCTIC_BASE)
+        if not token:
+            return None
+        return {"token": token, "base_url": base_url}
+    except Exception:
+        return None
+
+def fetch_spa_status_via_service() -> Dict[str, Any]:
+    """
+    Create a fresh Client for this call using config from st.secrets.
+    Returns dict: {ok, status_code, data, error}
+    """
+    cfg = _get_spa_config_from_secrets()
+    if cfg is None:
+        if not ARCTICSPAS_INSTALLED:
+            return {"ok": False, "status_code": None, "data": None, "error": "arcticspas package not installed"}
+        return {"ok": False, "status_code": None, "data": None, "error": "Client config or token unavailable (check st.secrets['arcticspa'])"}
+
+    # import spa op lazily
+    try:
+        from arcticspas.api.spa_control import v2_spa
+    except Exception:
+        try:
+            from arcticspas.operations import v2_spa  # fallback
+        except Exception as exc:
+            return {"ok": False, "status_code": None, "data": None, "error": f"Could not import spa operation: {exc}"}
+
+    # create fresh client for this call
+    try:
+        from arcticspas import Client
+        client = Client(base_url=cfg["base_url"], headers={"X-API-KEY": cfg["token"]})
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": f"Failed to construct client: {exc}"}
+
+    try:
+        with client as c:
+            resp = v2_spa.sync_detailed(client=c)
+            status_code = getattr(resp, "status_code", None)
+            parsed = getattr(resp, "parsed", None)
+            data = None
+            if parsed is None:
+                try:
+                    data = resp.json()  # type: ignore
+                except Exception:
+                    data = None
+            else:
+                try:
+                    data = parsed.to_dict()
+                except Exception:
+                    try:
+                        data = json.loads(json.dumps(parsed, default=lambda o: getattr(o, "__dict__", str(o))))
+                    except Exception:
+                        data = parsed
+            ok = 200 <= (status_code or 0) < 400
+            return {"ok": ok, "status_code": status_code, "data": data, "error": None if ok else f"HTTP {status_code}"}
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 # ---------------- Utilities ----------------
 def safe_rerun():
     try:
