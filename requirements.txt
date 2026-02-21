@@ -1,3 +1,4 @@
-streamlit
-requests
+streamlit>=1.20,<2.0
+requests>=2.28,<3.0
 arcticspas==2.0
+pandas>=1.5,<2.0
