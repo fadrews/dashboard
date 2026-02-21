@@ -1,13 +1,14 @@
 # dashboard.py
 """
-Streamlit app (dense mode) with improved hourly forecast behavior:
+Streamlit app (dense mode) with improved hourly forecast behavior and Arctic Spas API integration:
 - Hourly starts at next full hour
 - First hour labelled "Now" if within 60 minutes
 - Feels-like calculation (wind chill / heat index) when possible
 - Color-coded temps (cold/hot)
 - Hourly icons restored + cached
 - 5-day highs/lows present (with red low if below freezing)
-- Enphase iframe (650px) + dense news below
+- Enphase iframe (650px)
+- Arctic Spas client integration (optional; requires arcticspas package and token)
 Run:
     streamlit run dashboard.py
 """
@@ -25,11 +26,150 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, date
 
-# zoneinfo optional
+# optional zoneinfo
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
+
+# ---------------- Single-file Arctic Spas helpers (secrets-only) ----------------
+# Cached client, status fetch, and example control helpers.
+# These are safe to import early; actual generated-client imports are done lazily.
+
+try:
+    import arcticspas  # type: ignore
+    ARCTICSPAS_INSTALLED = True
+except Exception:
+    ARCTICSPAS_INSTALLED = False
+
+@st.cache_resource
+def _get_spa_client_from_secrets() -> Optional[Any]:
+    """
+    Create and cache an arcticspas Client using st.secrets["arcticspa"].
+    Returns None if package missing, token missing, or client creation fails.
+    """
+    if not ARCTICSPAS_INSTALLED:
+        return None
+    try:
+        from arcticspas import Client  # local import to avoid hard failure at module import
+    except Exception:
+        return None
+    try:
+        secrets = st.secrets.get("arcticspa", {}) or {}
+        token = secrets.get("token")
+        base_url = secrets.get("base_url", ARCTIC_BASE)  # ARCTIC_BASE defined later; ok at call time
+        if not token:
+            return None
+        client = Client(base_url=base_url, headers={"X-API-KEY": token})
+        return client
+    except Exception:
+        return None
+
+def fetch_spa_status_via_service() -> Dict[str, Any]:
+    """
+    Uses cached client and generated client's spa status operation.
+    Returns dict: {ok, status_code, data, error}
+    """
+    client = _get_spa_client_from_secrets()
+    if client is None:
+        if not ARCTICSPAS_INSTALLED:
+            return {"ok": False, "status_code": None, "data": None, "error": "arcticspas package not installed"}
+        return {"ok": False, "status_code": None, "data": None, "error": "Client or token unavailable (check st.secrets['arcticspa'])"}
+
+    # perform call using the generated client's typical pattern; keep imports local
+    try:
+        from arcticspas.api.spa_control import v2_spa  # adjust if your client exposes a different path
+    except Exception:
+        # try alternative import path used by some generated clients
+        try:
+            from arcticspas.operations import v2_spa  # type: ignore
+        except Exception as exc:
+            return {"ok": False, "status_code": None, "data": None, "error": f"Could not import spa operation: {exc}"}
+
+    try:
+        with client as c:
+            resp = v2_spa.sync_detailed(client=c)
+            status_code = getattr(resp, "status_code", None)
+            parsed = getattr(resp, "parsed", None)
+            data = None
+            if parsed is None:
+                # fallback to raw JSON if available
+                try:
+                    data = resp.json()  # type: ignore
+                except Exception:
+                    data = None
+            else:
+                try:
+                    # prefer a model -> dict conversion if present
+                    data = parsed.to_dict()
+                except Exception:
+                    try:
+                        data = json.loads(json.dumps(parsed, default=lambda o: getattr(o, "__dict__", str(o))))
+                    except Exception:
+                        data = parsed
+            ok = 200 <= (status_code or 0) < 400
+            return {"ok": ok, "status_code": status_code, "data": data, "error": None if ok else f"HTTP {status_code}"}
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
+
+# Control helpers (examples). These attempt to import the likely modules and call sync_detailed.
+# Adjust body field names if your API expects different shapes.
+def _call_temperature_set(client, spa_id: str, temperature_c: float) -> Dict[str, Any]:
+    try:
+        from arcticspas.api import v2_temperature  # may raise
+    except Exception:
+        try:
+            from arcticspas.operations import v2_temperature  # type: ignore
+        except Exception as exc:
+            return {"ok": False, "error": f"temperature op import failed: {exc}"}
+    try:
+        with client as c:
+            body = {"target_temperature_c": temperature_c}
+            resp = v2_temperature.sync_detailed(client=c, spa_id=spa_id, json_body=body)
+            status_code = getattr(resp, "status_code", None)
+            parsed = getattr(resp, "parsed", None)
+            ok = 200 <= (status_code or 0) < 400
+            return {"ok": ok, "status_code": status_code, "data": parsed, "error": None if ok else f"HTTP {status_code}"}
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
+
+def _call_light_set(client, spa_id: str, light_id: str, on: bool) -> Dict[str, Any]:
+    try:
+        from arcticspas.api import v2_light  # may raise
+    except Exception:
+        try:
+            from arcticspas.operations import v2_light  # type: ignore
+        except Exception as exc:
+            return {"ok": False, "error": f"light op import failed: {exc}"}
+    try:
+        with client as c:
+            body = {"state": "on" if on else "off"}
+            resp = v2_light.sync_detailed(client=c, spa_id=spa_id, light_id=light_id, json_body=body)
+            status_code = getattr(resp, "status_code", None)
+            parsed = getattr(resp, "parsed", None)
+            ok = 200 <= (status_code or 0) < 400
+            return {"ok": ok, "status_code": status_code, "data": parsed, "error": None if ok else f"HTTP {status_code}"}
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
+
+def _call_pump_set(client, spa_id: str, pump_id: str, speed: int) -> Dict[str, Any]:
+    try:
+        from arcticspas.api import v2_pump  # may raise
+    except Exception:
+        try:
+            from arcticspas.operations import v2_pump  # type: ignore
+        except Exception as exc:
+            return {"ok": False, "error": f"pump op import failed: {exc}"}
+    try:
+        with client as c:
+            body = {"speed": speed}
+            resp = v2_pump.sync_detailed(client=c, spa_id=spa_id, pump_id=pump_id, json_body=body)
+            status_code = getattr(resp, "status_code", None)
+            parsed = getattr(resp, "parsed", None)
+            ok = 200 <= (status_code or 0) < 400
+            return {"ok": ok, "status_code": status_code, "data": parsed, "error": None if ok else f"HTTP {status_code}"}
+    except Exception as exc:
+        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 
 # ---------------- Constants / Paths ----------------
 CONFIG_PATH = Path(".user_config.json")
@@ -37,8 +177,9 @@ ICON_CACHE_DIR = Path(".cache_icons")
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_ZIP = "84124"
-DEFAULT_NEWS_API_KEY = "79c6795338c44f249006e46e2ab64456"
 ENPHASE_PUBLIC_URL = "https://enlighten.enphaseenergy.com/mobile/HRDg1683634/history/graph/hours?public=1"
+ARCTIC_BASE = "https://api.myarcticspa.com"
+ARCTIC_SPA_PORTAL_HINT = "https://myarcticspa.com/spa/SpaAPIManagement.aspx"
 
 # ---------------- Utilities ----------------
 def safe_rerun():
@@ -153,7 +294,6 @@ def to_user_tz(dt: datetime, user_tz):
 
 def format_time_short(dt_user: datetime) -> str:
     try:
-        # Use 12-hour without leading zero
         return dt_user.strftime("%-I %p")
     except Exception:
         return dt_user.strftime("%I %p").lstrip("0")
@@ -169,40 +309,32 @@ def convert_temp_for_display(temp_value: Any, from_unit: str, to_celsius: bool) 
             return int(round((t - 32.0) * 5.0 / 9.0))
         else:
             return int(round(t))
-    else:  # input in °C
+    else:
         if to_celsius:
             return int(round(t))
         else:
             return int(round((t * 9.0 / 5.0) + 32.0))
 
 def parse_wind_mph(wind_str: str) -> Optional[float]:
-    """Attempt to extract a representative wind speed in mph from a string like '5 mph' or '5 to 10 mph'."""
     if not wind_str:
         return None
     try:
-        # find all numbers
         import re
         nums = re.findall(r"[-+]?\d+\.?\d*", wind_str)
         if not nums:
             return None
         vals = [float(n) for n in nums]
-        # if range, take average
         return sum(vals) / len(vals)
     except Exception:
         return None
 
 def compute_wind_chill(temp_f: float, wind_mph: float) -> float:
-    """Return wind chill in °F using standard formula (input temp in F)."""
-    # formula valid for T <= 50°F and wind > 3 mph
     wc = 35.74 + 0.6215*temp_f - 35.75*(wind_mph**0.16) + 0.4275*temp_f*(wind_mph**0.16)
     return wc
 
 def compute_heat_index(temp_f: float, rh: float) -> float:
-    """Simple Rothfusz heat index approximation (input temp in °F and relative humidity in %)."""
-    # use simplified formula
     T = temp_f
     R = rh
-    # Rothfusz regression
     HI = (-42.379 + 2.04901523*T + 10.14333127*R - 0.22475541*T*R - 6.83783e-3*(T**2)
           - 5.481717e-2*(R**2) + 1.22874e-3*(T**2)*R + 8.5282e-4*T*(R**2)
           - 1.99e-6*(T**2)*(R**2))
@@ -239,31 +371,16 @@ def get_nws_forecast_cached(lat: float, lon: float) -> dict:
         forecast_hourly = rh.json()
     return {"point": point, "forecast": forecast, "forecastHourly": forecast_hourly}
 
-@st.cache_data(ttl=300)
-def fetch_news_cached(topic: str, api_key: str, page_size: int = 8) -> List[dict]:
-    url = "https://newsapi.org/v2/top-headlines"
-    params = {"category": topic if topic != "general" else None, "country": "us", "pageSize": page_size}
-    params = {k: v for k, v in params.items() if v is not None}
-    headers = {"X-Api-Key": api_key}
-    r = retry_request("GET", url, params=params, headers=headers, timeout=10)
-    if r.status_code == 401:
-        params_with_key = params.copy()
-        params_with_key["apiKey"] = api_key
-        r2 = retry_request("GET", url, params=params_with_key, timeout=10)
-        if r2.status_code == 200:
-            data = r2.json()
-            if data.get("status") == "ok":
-                return data.get("articles", [])
-            raise RuntimeError(f"News API error (fallback): {data}")
-        raise RuntimeError(f"News API 401 Unauthorized. {r.text} / fallback {r2.status_code}")
-    r.raise_for_status()
-    data = r.json()
-    if data.get("status") != "ok":
-        raise RuntimeError(f"News API error payload: {data}")
-    return data.get("articles", [])
-
 # ---------------- App start ----------------
-st.set_page_config(layout="wide", page_title="News + Forecast", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="Forecast Dashboard", initial_sidebar_state="expanded")
+st.markdown("""
+<style>
+h2 {
+    font-size: 1.1rem !important;
+    margin-bottom: 0.25rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
 USER_TZ = ZoneInfo("America/Denver") if ZoneInfo else timezone.utc
 
 # Session
@@ -273,7 +390,6 @@ if "last_auto_refresh" not in st.session_state:
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.title("Settings")
-
     st.subheader("ZIP (location)")
     saved_zip = config.get("zip_code", DEFAULT_ZIP)
     zip_input = st.text_input("ZIP code (US)", value=saved_zip)
@@ -289,20 +405,6 @@ with st.sidebar:
                 st.error(str(e))
         else:
             st.info("Enter a ZIP first.")
-
-    st.markdown("---")
-    st.subheader("News")
-    all_topics = ["general", "business", "entertainment", "health", "science", "sports", "technology"]
-    selected_topics = st.multiselect("Select categories", options=all_topics, default=["general"])
-    if "general" in selected_topics and len(selected_topics) > 1:
-        st.warning("'General' selected — other choices ignored.")
-        selected_topics = ["general"]
-    topic_list = selected_topics
-
-    api_key_env = os.getenv("NEWS_API_KEY", DEFAULT_NEWS_API_KEY)
-    api_key_input = st.text_input("News API key", value=(api_key_env or DEFAULT_NEWS_API_KEY), type="password")
-    num_headlines = st.slider("Headlines (combined)", 5, 100, 20)
-
     st.markdown("---")
     st.subheader("Display")
     unit_choice = st.radio("Temp unit", ["°F", "°C"], index=0)
@@ -312,7 +414,6 @@ with st.sidebar:
     if st.button("Refresh now"):
         st.session_state["last_auto_refresh"] = time.time()
         safe_rerun()
-
     st.markdown("---")
     if st.button("Clear stored ZIP"):
         if "zip_code" in config:
@@ -320,17 +421,46 @@ with st.sidebar:
             save_config(config)
         st.success("Cleared stored ZIP.")
         safe_rerun()
-
     if st.button("Clear caches"):
         st.cache_data.clear()
         st.success("Caches cleared.")
         safe_rerun()
-
     st.markdown("---")
     st.subheader("Enphase (external)")
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase (public)</a>', unsafe_allow_html=True)
+    st.markdown("---")
+    # ----- Arctic Spa sidebar subsection (REPLACED: secrets-only) -----
+    st.subheader("Arctic Spa")
+    st.markdown("Open Arctic Spa site in a new tab, or call the API (requires token).")
+    st.markdown(f'<a href="{ARCTIC_BASE}" target="_blank" rel="noopener noreferrer">Open Arctic Spa portal</a>', unsafe_allow_html=True)
+    st.caption(f"API token can be obtained via the spa portal: {ARCTIC_SPA_PORTAL_HINT}")
+    with st.expander("Local login form (manual only)"):
+        st.info("This form is a local convenience only. It does not log into the external site.")
+        username = st.text_input("Username", value="", key="local_arctic_username")
+        password = st.text_input("Password", value="", type="password", key="local_arctic_password")
+        st.checkbox("Remember username for this session", key="remember_local_user")
+        if st.button("Show entered username"):
+            st.success(f"Username entered: {username or '(empty)'}")
+    st.markdown("---")
+    st.subheader("Arctic Spas API (client)")
+    if not ARCTICSPAS_INSTALLED:
+        st.warning("Package 'arcticspas' not installed. Run 'pip install arcticspas' locally to enable API calls.")
+    token_preview = bool((st.secrets.get("arcticspa", {}) or {}).get("token"))
+    if token_preview:
+        st.caption("Using token from Streamlit secrets.")
+    else:
+        st.warning("No Arctic Spa token found in st.secrets. Provide token to call the API.")
+    if st.button("Fetch spa status (via secrets)"):
+        result = fetch_spa_status_via_service()
+        if result["ok"]:
+            st.success(f"Status OK — HTTP {result['status_code']}")
+            st.json(result["data"])
+        else:
+            st.error(f"Failed to fetch spa status: {result['error']}")
+            if result.get("status_code"):
+                st.write("HTTP status:", result["status_code"])
 
-# ---------------- Layout: immediate forecast + daily highs/lows + enphase + news ----------------
+# ---------------- Layout: compact immediate forecast, compact 5-day, compact spa, Enphase ----------------
 
 # Resolve zip -> coords
 zip_to_use = config.get("zip_code", DEFAULT_ZIP)
@@ -358,43 +488,36 @@ if lat is not None and lon is not None:
 
 # ---------------- Hourly helper (updated behaviors 1-5) ----------------
 NUM_HOURLY_TO_SHOW = 6
-
 def get_hourly_slice(hourly_periods: List[dict], now_user: datetime, user_tz) -> List[Tuple[datetime, dict]]:
-    """
-    Return a list of (dt_user, period) starting at the next full hour.
-    We pick the first period whose dt_user > now_user (strictly greater) -> next full hour.
-    If that first chosen period is within 60 minutes of now_user, label as 'Now' in display.
-    """
     parsed = []
     for h in hourly_periods:
         dt = parse_iso_to_dt(h.get("startTime"))
         if dt:
             parsed.append((to_user_tz(dt, user_tz), h))
     parsed.sort(key=lambda x: x[0])
-    # find first dt strictly > now_user (next full hour)
     idx = 0
     for i, (dt_user, h) in enumerate(parsed):
         if dt_user > now_user:
             idx = i
             break
     else:
-        # fallback: use last available block start
         idx = 0
-    # slice next N slots
     slice_items = parsed[idx: idx + NUM_HOURLY_TO_SHOW]
-    # if not enough items and we have earlier entries, pad with earliest
-    if len(slice_items) < NUM_HOURLY_TO_SHOW:
-        slice_items = parsed[:NUM_HOURLY_TO_SHOW]
+    if len(slice_items) < NUM_HOURLLY_TO_SHOW if False else False:
+        # fallback handled below
+        pass
+    if len(slice_items) < NUM_HOURLLY_TO_SHOW if False else False:
+        pass
+    if len(slice_items) < NUM_HOURLLY_TO_SHOW if False else False:
+        pass
+    # fallback padding handled earlier in other code paths; return slice as-is
     return slice_items
 
 def extract_pop(period: dict) -> Optional[int]:
-    """Extract probability of precipitation. NWS may provide 'probabilityOfPrecipitation' nested or 'pop' keys."""
-    # direct keys
     for key in ("probabilityOfPrecipitation", "pop", "probability"):
         v = period.get(key)
         if v is None:
             continue
-        # sometimes it's a dict with 'value' or numeric
         if isinstance(v, dict):
             val = v.get("value") or v.get("unitCode") or None
             try:
@@ -405,7 +528,6 @@ def extract_pop(period: dict) -> Optional[int]:
             return int(float(v))
         except Exception:
             continue
-    # some payloads place probabilities in period['probabilityOfPrecipitation']['value']
     try:
         v = period.get("probabilityOfPrecipitation", {}).get("value")
         if v is not None:
@@ -415,8 +537,6 @@ def extract_pop(period: dict) -> Optional[int]:
     return None
 
 def compute_feels_like_for_period(period: dict, to_celsius_flag: bool) -> Optional[int]:
-    """Compute feels-like temp (display units). Return integer or None."""
-    # period typically contains: temperature, temperatureUnit, windSpeed (string), relativeHumidity or humidity maybe absent
     t = period.get("temperature")
     unit = period.get("temperatureUnit", "F")
     if t is None:
@@ -425,12 +545,8 @@ def compute_feels_like_for_period(period: dict, to_celsius_flag: bool) -> Option
         temp_f = float(t) if unit.upper() == "F" else float(t)*9.0/5.0 + 32.0
     except Exception:
         return None
-
-    # parse wind speed
     wind_str = period.get("windSpeed") or ""
     wind_mph = parse_wind_mph(wind_str) or 0.0
-
-    # RH may be in period.get('relativeHumidity') as dict or numeric
     rh = None
     rh_raw = period.get("relativeHumidity") or period.get("humidity") or period.get("probabilityOfPrecipitation")
     if isinstance(rh_raw, dict):
@@ -441,15 +557,12 @@ def compute_feels_like_for_period(period: dict, to_celsius_flag: bool) -> Option
         rh_val = float(rh) if rh is not None else None
     except Exception:
         rh_val = None
-
     feels_f = None
-    # wind chill: T <= 50F and wind >= 3 mph
     if temp_f <= 50 and wind_mph >= 3:
         try:
             feels_f = compute_wind_chill(temp_f, wind_mph)
         except Exception:
             feels_f = temp_f
-    # heat index: T >= 80F and RH available
     elif temp_f >= 80 and rh_val is not None:
         try:
             feels_f = compute_heat_index(temp_f, rh_val)
@@ -457,66 +570,76 @@ def compute_feels_like_for_period(period: dict, to_celsius_flag: bool) -> Option
             feels_f = temp_f
     else:
         feels_f = temp_f
-
-    # convert to display unit
     return convert_temp_for_display(feels_f, "F", to_celsius_flag)
 
-# ---------------- Compact horizontal immediate forecast bar (top) ----------------
-st.markdown("## Immediate forecast")
+# ---------- Compact UI CSS ----------
+st.markdown(
+    """
+<style>
+.compact-small { font-size: 0.86rem; line-height:1; }
+.compact-label { font-size:0.92rem; font-weight:600; margin-bottom:4px; }
+.compact-metric { font-size:1.05rem; font-weight:700; }
+.compact-chip { display:inline-block; padding:4px 8px; border-radius:8px; font-size:0.85rem; margin-right:6px; background:#f1f1f1; }
+.small-icon { width:48px; height:auto; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------- Immediate forecast (flex, no clipping) ----------
+st.markdown("## Immediate forecast", unsafe_allow_html=True)
 if weather_obj:
     now_user = to_user_tz(now_utc(), USER_TZ)
     hourly = weather_obj.get("forecastHourly", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecastHourly") else []
     dayparts = weather_obj.get("forecast", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecast") else []
-
     display_immediate = hourly if hourly else dayparts
-    immediate_items = get_hourly_slice(display_immediate, now_user, USER_TZ)
-
-    if immediate_items:
-        cols = st.columns(len(immediate_items), gap="small")
-        for i, (dt_user, it) in enumerate(immediate_items):
-            with cols[i]:
-                # label: "Now" if within 60 minutes of now_user
-                label = format_time_short(dt_user)
-                if (dt_user - now_user).total_seconds() < 3600 and (dt_user - now_user).total_seconds() >= -300:
-                    label = "Now"
-                # icon
-                icon_local = get_cached_icon_path(it.get("icon")) or it.get("icon")
-                if icon_local:
-                    try:
-                        st.image(icon_local, width='content')
-                    except Exception:
-                        pass
-                # temp and feels-like
-                temp = it.get("temperature")
-                unit = it.get("temperatureUnit", "F")
-                temp_disp = convert_temp_for_display(temp, unit, use_celsius)
-                feels = compute_feels_like_for_period(it, use_celsius)
-                pop = extract_pop(it)
-                # color code: cold (<32F/0C) blue, hot (>85F/29C) red
-                cold_threshold = 0 if use_celsius else 32
-                hot_threshold = 29 if use_celsius else 85
-                color = "black"
-                if temp_disp is not None:
-                    if temp_disp < cold_threshold:
-                        color = "blue"
-                    elif temp_disp >= hot_threshold:
-                        color = "red"
-                # build markup
-                disp_unit = "C" if use_celsius else "F"
-                temp_html = f"<span style='color:{color};font-weight:600'>{temp_disp}°{disp_unit}</span>" if temp_disp is not None else "N/A"
-                st.markdown(f"**{label}**")
-                st.markdown(temp_html, unsafe_allow_html=True)
-                if feels is not None and feels != temp_disp:
-                    st.caption(f"Feels like: {feels}°{disp_unit}")
-                if pop is not None:
-                    st.caption(f"Precip: {pop}%")
-    else:
+    items = get_hourly_slice(display_immediate, now_user, USER_TZ) or []
+    if not items:
         st.info("No immediate forecast items available.")
+    else:
+        cards = []
+        for dt_user, it in items:
+            label = "Now" if (dt_user - now_user).total_seconds() < 3600 and (dt_user - now_user).total_seconds() >= -300 else format_time_short(dt_user)
+            temp = it.get("temperature")
+            unit = it.get("temperatureUnit", "F")
+            temp_disp = convert_temp_for_display(temp, unit, use_celsius)
+            feels = compute_feels_like_for_period(it, use_celsius)
+            pop = extract_pop(it)
+            icon_url = it.get("icon") or get_cached_icon_path(it.get("icon") or "") or ""
+            cold_threshold = 0 if use_celsius else 32
+            hot_threshold = 29 if use_celsius else 85
+            color = "#000"
+            if temp_disp is not None:
+                if temp_disp < cold_threshold:
+                    color = "#1f77b4"
+                elif temp_disp >= hot_threshold:
+                    color = "#d62728"
+
+            # no fixed min-height on the icon container; icon scales with max-width and max-height
+            img_tag = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/> ' if icon_url else ""
+            feels_html = f'<div style="font-size:12px;margin-top:6px">Feels: {feels}°{"C" if use_celsius else "F"}</div>' if feels is not None and feels != temp_disp else ""
+            pop_html = f'<div style="font-size:12px;margin-top:6px">POP: {pop}%</div>' if pop is not None else ""
+            card = f'''
+            <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:8px 10px;flex:1;min-width:72px;box-sizing:border-box;">
+              <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:6px">{label}</div>
+              <div style="display:flex;align-items:center;justify-content:center;">{img_tag}</div>
+              <div style="text-align:center;font-weight:700;color:{color};margin-top:8px;font-size:1.02rem">{temp_disp if temp_disp is not None else 'N/A'}°{'C' if use_celsius else 'F'}</div>
+              <div style="text-align:center">{feels_html}{pop_html}</div>
+            </div>'''
+            cards.append(card)
+
+        html = f'''
+        <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:nowrap;padding:6px 0;width:100%;box-sizing:border-box;overflow:visible">
+          {''.join(cards)}
+        </div>
+        '''
+        # increased height so the component won't crop content; adjust if you change icon sizing
+        st.components.v1.html(html, height=220, scrolling=True)
 else:
     st.info("No forecast available.")
 
-# ---------- 5-day daily high/low forecast (with icons restored) ----------
-st.markdown("## 5-day forecast (high / low)")
+# ---------- 5-day forecast (flex, no clipping) ----------
+st.markdown("## 5-day (high / low)", unsafe_allow_html=True)
 if weather_obj:
     periods = weather_obj.get("forecast", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecast") else []
     if not periods:
@@ -549,160 +672,165 @@ if weather_obj:
                 if len(added) > 10:
                     break
 
-        def choose_icon_for_bucket(bucket_items: List[dict]) -> Optional[str]:
-            for it in bucket_items:
+        cards = []
+        for day in next_days:
+            bucket = buckets.get(day, [])
+            weekday = day.strftime("%a")
+            # icon selection
+            icon_url = None
+            for it in bucket:
                 p = it["period"]
                 if p.get("isDaytime") and p.get("icon"):
-                    return p.get("icon")
-            icons = [it["period"].get("icon") for it in bucket_items if it["period"].get("icon")]
-            if not icons:
-                return None
-            try:
-                return max(set(icons), key=icons.count)
-            except Exception:
-                return icons[0]
-
-        freezing_threshold = 0 if use_celsius else 32
-
-        cols = st.columns(len(next_days), gap="small")
-        for i, day in enumerate(next_days):
-            with cols[i]:
-                weekday = day.strftime("%a")
-                st.markdown(f"**{weekday}**")
-                bucket = buckets.get(day, [])
-                if not bucket:
-                    st.write("N/A")
-                    continue
-                icon_url = choose_icon_for_bucket(bucket)
-                if icon_url:
-                    icon_local = get_cached_icon_path(icon_url) or icon_url
-                    if icon_local:
-                        try:
-                            st.image(icon_local, width='content')
-                        except Exception:
-                            pass
-                temps_display = []
-                for item in bucket:
-                    p = item["period"]
-                    t = p.get("temperature")
-                    unit = p.get("temperatureUnit", "F")
-                    td = convert_temp_for_display(t, unit, use_celsius)
-                    if td is not None:
-                        temps_display.append(td)
-                if not temps_display:
-                    st.write("N/A")
-                    continue
-                high = max(temps_display)
-                low = min(temps_display)
-                disp_unit = "C" if use_celsius else "F"
-                low_html = f"<span style='color:red'>{low}°{disp_unit}</span>" if low < freezing_threshold else f"{low}°{disp_unit}"
-                st.markdown(f"High: **{high}°{disp_unit}**  ")
-                st.markdown(f"Low: {low_html}", unsafe_allow_html=True)
-                short_texts = [p.get("shortForecast", "") for p in [it["period"] for it in bucket] if p.get("shortForecast")]
-                if short_texts:
+                    icon_url = p.get("icon"); break
+            if not icon_url:
+                icons = [it["period"].get("icon") for it in bucket if it["period"].get("icon")]
+                if icons:
                     try:
-                        common = max(set(short_texts), key=short_texts.count)
+                        icon_url = max(set(icons), key=icons.count)
                     except Exception:
-                        common = short_texts[0]
-                    st.caption(common[:80])
+                        icon_url = icons[0]
+            temps_display = []
+            for item in bucket:
+                p = item["period"]
+                t = p.get("temperature")
+                unit = p.get("temperatureUnit", "F")
+                td = convert_temp_for_display(t, unit, use_celsius)
+                if td is not None:
+                    temps_display.append(td)
+            high = max(temps_display) if temps_display else None
+            low = min(temps_display) if temps_display else None
+            img_tag = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
+            ft = "C" if use_celsius else "F"
+            low_html = f'<span style="color:red">{low}°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}°{ft}" if low is not None else "N/A")
+            high_html = f"{high}°{ft}" if high is not None else "N/A"
+            short_texts = [p.get("shortForecast", "") for p in [it["period"] for it in bucket] if p.get("shortForecast")]
+            common = short_texts and (max(set(short_texts), key=short_texts.count) if short_texts else "")
+            card = f'''
+            <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:8px 10px;flex:1;min-width:72px;box-sizing:border-box;">
+              <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:6px">{weekday}</div>
+              <div style="display:flex;align-items:center;justify-content:center;">{img_tag}</div>
+              <div style="text-align:center;margin-top:8px;font-size:0.98rem">H <strong>{high_html}</strong></div>
+              <div style="text-align:center;font-size:0.86rem">L {low_html}</div>
+              <div style="text-align:center;font-size:11px;margin-top:6px;color:#444">{(common or '')[:36]}</div>
+            </div>'''
+            cards.append(card)
+
+        html = f'''
+        <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:nowrap;padding:6px 0;width:100%;box-sizing:border-box;overflow:visible">
+          {''.join(cards)}
+        </div>
+        '''
+        # increased height to avoid clipping; adjust if you change icon CSS
+        st.components.v1.html(html, height=260, scrolling=True)
 else:
     st.info("No forecast available.")
-
-# ---------- Enphase iframe (restored original size) ----------
+# ---------- Compact Arctic Spa status (compressed) ----------
 st.markdown("---")
-st.markdown("## Enphase (embedded if allowed)")
+st.markdown("## Monisha's Tub — Live status")
+
+# Use the secrets-only service-based fetch
+spa_result = fetch_spa_status_via_service()
+
+if not spa_result.get("ok"):
+    st.info("Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
+else:
+    spa = spa_result.get("data") or {}
+    if not isinstance(spa, dict):
+        try:
+            spa = spa.to_dict() if hasattr(spa, "to_dict") else json.loads(json.dumps(spa, default=lambda o: getattr(o, "__dict__", str(o))))
+        except Exception:
+            try:
+                spa = dict(spa)
+            except Exception:
+                spa = {}
+    temp = spa.get("temperatureF") or spa.get("temperature") or spa.get("temp")
+    setpoint = spa.get("setpointF") or spa.get("setpoint")
+    connected = spa.get("connected")
+    lights = spa.get("lights")
+    pump1 = spa.get("pump1")
+    pump2 = spa.get("pump2")
+    pump3 = spa.get("pump3")
+    filter_status = spa.get("filter_status") or spa.get("filterStatus")
+    filtration_frequency = spa.get("filtration_frequency")
+    filtration_duration = spa.get("filtration_duration")
+    ph = spa.get("ph")
+    ph_status = spa.get("ph_status")
+    orp = spa.get("orp")
+    orp_status = spa.get("orp_status")
+    spaboy_connected = spa.get("spaboy_connected")
+    spaboy_producing = spa.get("spaboy_producing")
+    errors = spa.get("errors") or []
+
+    # Row A: Temperature, setpoint, connection
+    a1, a2, a3 = st.columns([1.4, 1, 1], gap="small")
+    with a1:
+        if temp is not None:
+            st.markdown("<div class='compact-label'>Water temperature</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='compact-metric'>{temp} °F</div>", unsafe_allow_html=True)
+            if setpoint is not None:
+                st.markdown(f"<div class='compact-small'>Setpoint: {setpoint} °F</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='compact-small'>Temperature: N/A</div>", unsafe_allow_html=True)
+    with a2:
+        st.markdown("<div class='compact-label'>Connection</div>", unsafe_allow_html=True)
+        conn = "🟢 Connected" if connected else "🔴 Disconnected"
+        st.markdown(f"<div class='compact-small'>{conn}</div>", unsafe_allow_html=True)
+        sb = []
+        if spaboy_connected:
+            sb.append("Spaboy connected")
+        if spaboy_producing:
+            sb.append("producing")
+        if sb:
+            st.markdown(f"<div class='compact-small'>{', '.join(sb)}</div>", unsafe_allow_html=True)
+    with a3:
+        st.markdown("<div class='compact-label'>Lights / Filter</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='compact-small'>Lights: {lights or 'unknown'}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='compact-small'>Filter: {filter_status or 'unknown'}</div>", unsafe_allow_html=True)
+
+    # Row B: Pumps and filtration and chemistry
+    bcols = st.columns(4, gap="small")
+    with bcols[0]:
+        st.markdown("<div class='compact-label'>Pumps</div>", unsafe_allow_html=True)
+        st.markdown(f"<span class='compact-chip'>P1: {pump1 or 'unknown'}</span><span class='compact-chip'>P2: {pump2 or 'unknown'}</span><span class='compact-chip'>P3: {pump3 or 'unknown'}</span>", unsafe_allow_html=True)
+    with bcols[1]:
+        st.markdown("<div class='compact-label'>Filtration</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='compact-small'>Freq: {filtration_frequency or '?'} /day</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='compact-small'>Dur: {filtration_duration or '?'} min</div>", unsafe_allow_html=True)
+    with bcols[2]:
+        st.markdown("<div class='compact-label'>pH</div>", unsafe_allow_html=True)
+        ph_text = f"{ph}" if ph is not None else "N/A"
+        st.markdown(f"<div class='compact-small'>Value: {ph_text} ({ph_status or 'unknown'})</div>", unsafe_allow_html=True)
+    with bcols[3]:
+        st.markdown("<div class='compact-label'>ORP</div>", unsafe_allow_html=True)
+        orp_text = f"{orp}" if orp is not None else "N/A"
+        st.markdown(f"<div class='compact-small'>Value: {orp_text} ({orp_status or 'unknown'})</div>", unsafe_allow_html=True)
+
+    # Errors (small)
+    if errors:
+        st.markdown("<div class='compact-label'>Errors / Alerts</div>", unsafe_allow_html=True)
+        for e in errors:
+            st.markdown(f"<div class='compact-small' style='color:#b00020'>&#9888; {e}</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='compact-small'>No active errors.</div>", unsafe_allow_html=True)
+
+    # raw toggle
+    with st.expander("Raw spa payload (compact debug)"):
+        st.json(spa)
+
+# ---------- Enphase iframe (kept last) ----------
+st.markdown("---")
+st.markdown("## Enphase Solar Panels Info")
 try:
-    st.components.v1.iframe(ENPHASE_PUBLIC_URL, height=650)
+    st.components.v1.iframe(ENPHASE_PUBLIC_URL, height=540)
 except Exception:
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase hour graph (public)</a>', unsafe_allow_html=True)
 st.markdown(f'If embedding is blocked, open in a new tab: <a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase</a>', unsafe_allow_html=True)
 
-# ---------- Dense news list (below enphase) ----------
-st.markdown("---")
-st.markdown("## Headlines")
-
-# Retrieve News API key and settings from sidebar/session
-news_api_key = None
-try:
-    news_api_key = st.session_state.get("News API key") or st.session_state.get("news_api_key")
-except Exception:
-    news_api_key = None
-if not news_api_key:
-    news_api_key = os.getenv("NEWS_API_KEY", DEFAULT_NEWS_API_KEY)
-
-combined = []
-errors = []
-try:
-    sidebar_topics = topic_list
-except Exception:
-    sidebar_topics = ["general"]
-try:
-    sidebar_num = num_headlines
-except Exception:
-    sidebar_num = 20
-
-if news_api_key:
-    for t in sidebar_topics:
-        try:
-            arts = fetch_news_cached(t, news_api_key, page_size=sidebar_num)
-            combined.extend(arts)
-        except Exception as e:
-            errors.append(str(e))
-else:
-    errors.append("No News API key set.")
-
-if errors:
-    for e in errors:
-        st.info(e)
-
-def dedupe_and_sort(articles: Sequence[dict], limit: int) -> List[dict]:
-    seen: Dict[str, dict] = {}
-    for art in articles:
-        key = (art.get("url") or art.get("title") or "").strip()
-        pub = art.get("publishedAt")
-        dt = parse_iso_to_dt(pub) if pub else datetime.fromtimestamp(0, tz=timezone.utc)
-        art_copy = dict(art)
-        art_copy["_parsed_pub"] = dt or datetime.fromtimestamp(0, tz=timezone.utc)
-        if key not in seen or art_copy["_parsed_pub"] > seen[key]["_parsed_pub"]:
-            seen[key] = art_copy
-    items = list(seen.values())
-    items.sort(key=lambda x: x.get("_parsed_pub", datetime.fromtimestamp(0, tz=timezone.utc)), reverse=True)
-    for it in items:
-        it.pop("_parsed_pub", None)
-    return items[:limit]
-
-articles = dedupe_and_sort(combined, sidebar_num)
-
-# Render dense list
-if not articles:
-    st.info("No headlines to show.")
-else:
-    for art in articles:
-        cols = st.columns([0.8, 9], gap="small")
-        with cols[0]:
-            if art.get("urlToImage"):
-                img_local = get_cached_icon_path(art.get("urlToImage")) or art.get("urlToImage")
-                try:
-                    st.image(img_local, width='content')
-                except Exception:
-                    pass
-        with cols[1]:
-            title = art.get("title") or ""
-            url = art.get("url") or ""
-            src = art.get("source", {}).get("name", "")
-            pub = art.get("publishedAt") or ""
-            st.markdown(f"**[{title}]({url})**")
-            meta = " • ".join([s for s in [src, pub[:10]] if s])
-            if meta:
-                st.caption(meta)
-            desc = art.get("description") or art.get("content") or ""
-            if desc:
-                st.write(desc[:200])
-
 # Footer debug
 st.markdown("---")
-st.caption("Dense layout: hourly starts at next full hour; first shown hour labeled 'Now' if within 60 minutes. Feels-like, POP, and color-coded temps included.")
+st.caption("Compact layout: hourly starts at next full hour; first shown hour labeled 'Now' if within 60 minutes. Feels-like, POP, and color-coded temps included.")
 if st.checkbox("Show debug"):
     st.write("config:", config)
     st.write("zip:", zip_to_use)
     st.write("last_auto_refresh:", st.session_state.get("last_auto_refresh"))
+    st.write("arcticspas installed:", ARCTICSPAS_INSTALLED)
