@@ -497,14 +497,83 @@ def get_nws_forecast_cached(lat: float, lon: float) -> dict:
 
 # ---------------- App start ----------------
 st.set_page_config(layout="wide", page_title="Forecast Dashboard", initial_sidebar_state="expanded")
-st.markdown("""
-<style>
-h2 {
-    font-size: 1.1rem !important;
-    margin-bottom: 0.25rem !important;
+# put this immediately after st.set_page_config(...) near the top of the file
+st.markdown(
+    """
+    <style>
+    /* --- Compact app spacing & typography (global) --- */
+    h2 {
+      font-size: 1.1rem !important;
+      margin-top: 6px !important;
+      margin-bottom: 6px !important;
+    }
+
+    /* tighten default paragraph spacing used by Streamlit markdown */
+    .stMarkdown p { margin: 6px 0 !important; }
+
+    /* reduce top/bottom padding for main container children */
+    .block-container > div { padding-top: 6px !important; padding-bottom: 6px !important; }
+
+    /* --- Responsive grid / card helpers (used by forecast blocks) --- */
+    .responsive-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      align-items: start;
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 0;
+      margin: 0;
+    }
+
+    .responsive-card {
+      display:flex;
+      flex-direction:column;
+      align-items:stretch;
+      justify-content:flex-start;
+      padding:8px 10px;
+      box-sizing:border-box;
+      min-width: 120px;
+      margin-bottom: 4px;
+    }
+
+    /* reduce spacing around the responsive grids */
+    .responsive-grid { margin-bottom: 6px !important; }
+
+    /* --- Frame (border) styles for sections --- */
+ .frame {
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 10px;
+  padding: 12px;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.06);
+  background: #e6f7ff; /* slightly stronger pale blue */
+  margin-bottom: 8px;
 }
-</style>
-""", unsafe_allow_html=True)
+   .frame.compact { padding: 8px; border-radius: 8px; margin-bottom:6px; }
+    .frame-header {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:8px;
+    }
+    .frame-header h2 { margin:0; font-size:1.05rem; font-weight:600; }
+    .frame-sub { color:#666; font-size:0.9rem; }
+
+    /* --- Small screen tweaks --- */
+    @media (max-width:640px) {
+      .frame { padding: 8px; margin-bottom:8px; }
+      .frame-header h2 { font-size: 1rem; }
+      .responsive-card { padding:6px 8px; min-width: 100px; }
+    }
+
+    /* small hr / separators */
+    hr { margin: 6px 0 !important; height: 1px !important; border: none; background: #eee; }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 USER_TZ = ZoneInfo("America/Denver") if ZoneInfo else timezone.utc
 
 # Session
@@ -529,7 +598,7 @@ with st.sidebar:
                 st.error(str(e))
         else:
             st.info("Enter a ZIP first.")
-    st.markdown("---")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.subheader("Display")
     unit_choice = st.radio("Temp unit", ["°F", "°C"], index=0)
     use_celsius = unit_choice == "°C"
@@ -538,7 +607,7 @@ with st.sidebar:
     if st.button("Refresh now"):
         st.session_state["last_auto_refresh"] = time.time()
         safe_rerun()
-    st.markdown("---")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     if st.button("Clear stored ZIP"):
         if "zip_code" in config:
             del config["zip_code"]
@@ -549,10 +618,10 @@ with st.sidebar:
         st.cache_data.clear()
         st.success("Caches cleared.")
         safe_rerun()
-    st.markdown("---")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.subheader("Enphase (external)")
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase (public)</a>', unsafe_allow_html=True)
-    st.markdown("---")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     # ----- Arctic Spa sidebar subsection (REPLACED: secrets-only) -----
     st.subheader("Arctic Spa")
     st.markdown("Open Arctic Spa site in a new tab, or call the API (requires token).")
@@ -565,7 +634,7 @@ with st.sidebar:
         st.checkbox("Remember username for this session", key="remember_local_user")
         if st.button("Show entered username"):
             st.success(f"Username entered: {username or '(empty)'}")
-    st.markdown("---")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.subheader("Arctic Spas API (client)")
     if not ARCTICSPAS_INSTALLED:
         st.warning("Package 'arcticspas' not installed. Run 'pip install arcticspas' locally to enable API calls.")
@@ -752,13 +821,61 @@ if weather_obj:
             </div>'''
             cards.append(card)
 
-        html = f'''
-        <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:nowrap;padding:6px 0;width:100%;box-sizing:border-box;overflow:visible">
-          {''.join(cards)}
+        # Responsive grid for immediate forecast
+        cards_html = ''.join(cards)  # unchanged: your per-card markup list
+
+        immediate_frame_html = f"""
+        <div class="frame">
+          <div class="frame-header">
+            <h2>Immediate forecast</h2>
+            <div class="frame-sub">Next {NUM_HOURLY_TO_SHOW} hours</div>
+          </div>
+
+          <div class="responsive-grid">
+            {cards_html}
+          </div>
         </div>
-        '''
-        # increased height so the component won't crop content; adjust if you change icon sizing
-        st.components.v1.html(html, height=220, scrolling=True)
+        """
+
+        # tune height to content; choose a value that avoids clipping
+        #st.components.v1.html(immediate_frame_html, height=220, scrolling=True)
+
+        responsive_immediate_html = f"""
+        <style>
+        .responsive-grid {{
+          display: grid;
+          gap: 10px;
+          grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+          align-items: start;
+          width: 100%;
+          box-sizing: border-box;
+          padding: 6px 0;
+        }}
+
+        .responsive-card {{
+          display:flex; flex-direction:column; align-items:stretch; justify-content:flex-start;
+          padding:8px 10px; box-sizing:border-box;
+          min-width: 120px;
+        }}
+
+        @media (max-width: 600px) {{
+          .responsive-card {{ padding:6px 8px; min-width: 100px; }}
+          .responsive-card .label {{ font-size:0.9rem; }}
+          .responsive-card .metric {{ font-size:1.0rem; }}
+        }}
+
+        @media (min-width: 1200px) {{
+          .responsive-card {{ min-height:140px; }}
+        }}
+        </style>
+
+        <div class="responsive-grid">
+          {cards_html}
+        </div>
+        """
+
+        # height can be tuned — set to a value that avoids clipping on your content
+        st.components.v1.html(responsive_immediate_html, height=220, scrolling=True)
 else:
     st.info("No forecast available.")
 
@@ -839,21 +956,69 @@ if weather_obj:
             </div>'''
             cards.append(card)
 
-        html = f'''
-        <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:nowrap;padding:6px 0;width:100%;box-sizing:border-box;overflow:visible">
-          {''.join(cards)}
+        # Responsive grid for 5-day forecast
+        cards_html = ''.join(cards)  # this is your 5-day cards list
+
+        five_day_frame_html = f"""
+        <div class="frame">
+          <div class="frame-header">
+            <h2>5-day (high / low)</h2>
+            <div class="frame-sub">Daily highs & lows</div>
+          </div>
+
+          <div class="responsive-grid">
+            {cards_html}
+          </div>
         </div>
-        '''
-        # increased height to avoid clipping; adjust if you change icon CSS
-        st.components.v1.html(html, height=260, scrolling=True)
+        """
+
+        #st.components.v1.html(five_day_frame_html, height=260, scrolling=True)
+
+        responsive_5day_html = f"""
+        <style>
+        .responsive-grid {{
+          display: grid;
+          gap: 10px;
+          grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+          align-items: start;
+          width: 100%;
+          box-sizing: border-box;
+          padding: 6px 0;
+        }}
+        .responsive-card {{ padding:8px 10px; box-sizing:border-box; min-width:130px; }}
+
+        @media (max-width: 640px) {{
+          .responsive-card {{ padding:6px 8px; min-width:110px; }}
+          .responsive-card .label {{ font-size:0.9rem; }}
+        }}
+        </style>
+
+        <div class="responsive-grid">
+          {cards_html}
+        </div>
+        """
+
+        st.components.v1.html(responsive_5day_html, height=260, scrolling=True)
 else:
     st.info("No forecast available.")
 # ---------- Compact Arctic Spa status (compressed) ----------
-st.markdown("---")
-st.markdown("## Monisha's Tub — Live status")
+# open frame
+st.markdown("<div class='frame'>", unsafe_allow_html=True)
 
-# Use the secrets-only service-based fetch
+# header row inside frame
+st.markdown("<div class='frame-header'><h2>Monisha's Tub — Live status</h2><div class='frame-sub'>Live spa data</div></div>", unsafe_allow_html=True)
+
+# now render the same Streamlit columns / content you had (unchanged)
 spa_result = fetch_spa_status_via_service()
+
+if not spa_result.get("ok"):
+    st.info("Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
+else:
+    # ... existing code that creates st.columns and the status UI ...
+    # keep it unchanged
+
+# close frame
+    st.markdown("</div>", unsafe_allow_html=True)
 
 if not spa_result.get("ok"):
     st.info("Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
@@ -942,7 +1107,7 @@ else:
         st.json(spa)
 
 # ---------- Enphase iframe (kept last) ----------
-st.markdown("---")
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 st.markdown("## Enphase Solar Panels Info")
 try:
     st.components.v1.iframe(ENPHASE_PUBLIC_URL, height=540)
@@ -951,7 +1116,7 @@ except Exception:
 st.markdown(f'If embedding is blocked, open in a new tab: <a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase</a>', unsafe_allow_html=True)
 
 # Footer debug
-st.markdown("---")
+st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 st.caption("Compact layout: hourly starts at next full hour; first shown hour labeled 'Now' if within 60 minutes. Feels-like, POP, and color-coded temps included.")
 if st.checkbox("Show debug"):
     st.write("config:", config)
