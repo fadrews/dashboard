@@ -9,6 +9,14 @@ Streamlit app (dense mode) with improved hourly forecast behavior and Arctic Spa
 - 5-day highs/lows present (with red low if below freezing)
 - Enphase iframe (650px)
 - Arctic Spas client integration (optional; requires arcticspas package and token)
+- Alerts sent via ntfy.sh (free push notifications, no account needed)
+
+ntfy alert setup (one-time):
+  1. Install the "ntfy" app on your phone (iOS or Android)
+  2. Subscribe to your chosen topic name (e.g. "monishas-tub-alerts")
+  3. Set NTFY_TOPIC in st.secrets or env vars (default: monishas-tub-alerts)
+  4. Optionally set NTFY_SERVER if self-hosting (default: https://ntfy.sh)
+
 Run:
     streamlit run dashboard.py
 """
@@ -26,6 +34,43 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, date
 
+
+# ---------- ntfy.sh alert config & helper ----------
+# ntfy is a free, no-account push notification service: https://ntfy.sh
+# Setup:
+#   1. Install the "ntfy" app on iOS or Android
+#   2. Subscribe to your topic (e.g. "monishas-tub-alerts") inside the app
+#   3. Set NTFY_TOPIC (and optionally NTFY_SERVER) in st.secrets or env vars
+
+NTFY_TOPIC  = st.secrets.get("NTFY_TOPIC",  None) or os.environ.get("NTFY_TOPIC")  or "monishas-tub-alerts"
+NTFY_SERVER = st.secrets.get("NTFY_SERVER", None) or os.environ.get("NTFY_SERVER") or "https://ntfy.sh"
+
+def _ascii_safe(s: str) -> str:
+    """Strip any characters outside latin-1 range (for HTTP headers)."""
+    return s.encode("latin-1", errors="ignore").decode("latin-1")
+
+def send_ntfy_message(topic: str, title: str, message: str, server: str = NTFY_SERVER,
+                      priority: str = "high", tags: str = "warning,bathtub") -> None:
+    """
+    Send a push notification via ntfy.sh (or self-hosted ntfy server).
+    Raises RuntimeError on failure.
+    Docs: https://docs.ntfy.sh/publish/
+    """
+    if not topic:
+        raise ValueError("NTFY_TOPIC is not set. Add it to st.secrets or env vars.")
+    url = f"{server.rstrip('/')}/{topic}"
+    # HTTP headers must be latin-1 safe — strip emoji/unicode from title
+    headers = {
+        "Title":        _ascii_safe(title),
+        "Priority":     priority,
+        "Tags":         tags,
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    # message body is sent as UTF-8 bytes so emoji are fine there
+    resp = requests.post(url, data=message.encode("utf-8"), headers=headers, timeout=15)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"ntfy returned HTTP {resp.status_code}: {resp.text[:200]}")
+
 # optional zoneinfo
 try:
     from zoneinfo import ZoneInfo
@@ -33,9 +78,6 @@ except Exception:
     ZoneInfo = None
 
 # ---------------- Single-file Arctic Spas helpers (secrets-only) ----------------
-# Cached client, status fetch, and example control helpers.
-# These are safe to import early; actual generated-client imports are done lazily.
-
 try:
     import arcticspas  # type: ignore
     ARCTICSPAS_INSTALLED = True
@@ -43,52 +85,20 @@ except Exception:
     ARCTICSPAS_INSTALLED = False
 
 @st.cache_resource
-def fetch_spa_status_via_service() -> Dict[str, Any]:
+def _get_spa_config_from_secrets() -> Optional[Dict[str, str]]:
     """
-    Uses cached client and generated client's spa status operation.
-    Returns dict: {ok, status_code, data, error}
+    Return {'token': ..., 'base_url': ...} or None.
+    Cached to avoid repeated st.secrets access, but does NOT cache a Client object.
     """
-    client = _get_spa_client_from_secrets()
-    if client is None:
-        if not ARCTICSPAS_INSTALLED:
-            return {"ok": False, "status_code": None, "data": None, "error": "arcticspas package not installed"}
-        return {"ok": False, "status_code": None, "data": None, "error": "Client or token unavailable (check st.secrets['arcticspa'])"}
-
-    # perform call using the generated client's typical pattern; keep imports local
     try:
-        from arcticspas.api.spa_control import v2_spa  # adjust if your client exposes a different path
+        secrets = st.secrets.get("arcticspa", {}) or {}
+        token = secrets.get("token")
+        base_url = secrets.get("base_url", ARCTIC_BASE)
+        if not token:
+            return None
+        return {"token": token, "base_url": base_url}
     except Exception:
-        # try alternative import path used by some generated clients
-        try:
-            from arcticspas.operations import v2_spa  # type: ignore
-        except Exception as exc:
-            return {"ok": False, "status_code": None, "data": None, "error": f"Could not import spa operation: {exc}"}
-
-    try:
-        with client as c:
-            resp = v2_spa.sync_detailed(client=c)
-            status_code = getattr(resp, "status_code", None)
-            parsed = getattr(resp, "parsed", None)
-            data = None
-            if parsed is None:
-                # fallback to raw JSON if available
-                try:
-                    data = resp.json()  # type: ignore
-                except Exception:
-                    data = None
-            else:
-                try:
-                    # prefer a model -> dict conversion if present
-                    data = parsed.to_dict()
-                except Exception:
-                    try:
-                        data = json.loads(json.dumps(parsed, default=lambda o: getattr(o, "__dict__", str(o))))
-                    except Exception:
-                        data = parsed
-            ok = 200 <= (status_code or 0) < 400
-            return {"ok": ok, "status_code": status_code, "data": data, "error": None if ok else f"HTTP {status_code}"}
-    except Exception as exc:
-        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
+        return None
 
 def fetch_spa_status_via_service() -> Dict[str, Any]:
     """
@@ -101,16 +111,14 @@ def fetch_spa_status_via_service() -> Dict[str, Any]:
             return {"ok": False, "status_code": None, "data": None, "error": "arcticspas package not installed"}
         return {"ok": False, "status_code": None, "data": None, "error": "Client config or token unavailable (check st.secrets['arcticspa'])"}
 
-    # import spa op lazily
     try:
         from arcticspas.api.spa_control import v2_spa
     except Exception:
         try:
-            from arcticspas.operations import v2_spa  # fallback
+            from arcticspas.operations import v2_spa  # type: ignore
         except Exception as exc:
             return {"ok": False, "status_code": None, "data": None, "error": f"Could not import spa operation: {exc}"}
 
-    # create fresh client for this call
     try:
         from arcticspas import Client
         client = Client(base_url=cfg["base_url"], headers={"X-API-KEY": cfg["token"]})
@@ -141,7 +149,7 @@ def fetch_spa_status_via_service() -> Dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 
-    
+
 def _call_temperature_set(spa_id: str, temperature_c: float) -> Dict[str, Any]:
     cfg = _get_spa_config_from_secrets()
     if cfg is None:
@@ -238,73 +246,6 @@ ENPHASE_PUBLIC_URL = "https://enlighten.enphaseenergy.com/mobile/HRDg1683634/his
 ARCTIC_BASE = "https://api.myarcticspa.com"
 ARCTIC_SPA_PORTAL_HINT = "https://myarcticspa.com/spa/SpaAPIManagement.aspx"
 
-# Arctic secrets/config + service helpers — place BEFORE any code that uses them
-@st.cache_resource
-def _get_spa_config_from_secrets() -> Optional[Dict[str, str]]:
-    """
-    Return {'token': ..., 'base_url': ...} or None.
-    Cached to avoid repeated st.secrets access, but does NOT cache a Client object.
-    """
-    try:
-        secrets = st.secrets.get("arcticspa", {}) or {}
-        token = secrets.get("token")
-        base_url = secrets.get("base_url", ARCTIC_BASE)
-        if not token:
-            return None
-        return {"token": token, "base_url": base_url}
-    except Exception:
-        return None
-
-def fetch_spa_status_via_service() -> Dict[str, Any]:
-    """
-    Create a fresh Client for this call using config from st.secrets.
-    Returns dict: {ok, status_code, data, error}
-    """
-    cfg = _get_spa_config_from_secrets()
-    if cfg is None:
-        if not ARCTICSPAS_INSTALLED:
-            return {"ok": False, "status_code": None, "data": None, "error": "arcticspas package not installed"}
-        return {"ok": False, "status_code": None, "data": None, "error": "Client config or token unavailable (check st.secrets['arcticspa'])"}
-
-    # import spa op lazily
-    try:
-        from arcticspas.api.spa_control import v2_spa
-    except Exception:
-        try:
-            from arcticspas.operations import v2_spa  # fallback
-        except Exception as exc:
-            return {"ok": False, "status_code": None, "data": None, "error": f"Could not import spa operation: {exc}"}
-
-    # create fresh client for this call
-    try:
-        from arcticspas import Client
-        client = Client(base_url=cfg["base_url"], headers={"X-API-KEY": cfg["token"]})
-    except Exception as exc:
-        return {"ok": False, "status_code": None, "data": None, "error": f"Failed to construct client: {exc}"}
-
-    try:
-        with client as c:
-            resp = v2_spa.sync_detailed(client=c)
-            status_code = getattr(resp, "status_code", None)
-            parsed = getattr(resp, "parsed", None)
-            data = None
-            if parsed is None:
-                try:
-                    data = resp.json()  # type: ignore
-                except Exception:
-                    data = None
-            else:
-                try:
-                    data = parsed.to_dict()
-                except Exception:
-                    try:
-                        data = json.loads(json.dumps(parsed, default=lambda o: getattr(o, "__dict__", str(o))))
-                    except Exception:
-                        data = parsed
-            ok = 200 <= (status_code or 0) < 400
-            return {"ok": ok, "status_code": status_code, "data": data, "error": None if ok else f"HTTP {status_code}"}
-    except Exception as exc:
-        return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 # ---------------- Utilities ----------------
 def safe_rerun():
     try:
@@ -497,7 +438,7 @@ def get_nws_forecast_cached(lat: float, lon: float) -> dict:
 
 # ---------------- App start ----------------
 st.set_page_config(layout="wide", page_title="Forecast Dashboard", initial_sidebar_state="expanded")
-# put this immediately after st.set_page_config(...) near the top of the file
+
 st.markdown(
     """
     <style>
@@ -508,13 +449,10 @@ st.markdown(
       margin-bottom: 6px !important;
     }
 
-    /* tighten default paragraph spacing used by Streamlit markdown */
     .stMarkdown p { margin: 6px 0 !important; }
-
-    /* reduce top/bottom padding for main container children */
     .block-container > div { padding-top: 6px !important; padding-bottom: 6px !important; }
 
-    /* --- Responsive grid / card helpers (used by forecast blocks) --- */
+    /* --- Responsive grid / card helpers --- */
     .responsive-grid {
       display: grid;
       gap: 10px;
@@ -537,19 +475,94 @@ st.markdown(
       margin-bottom: 4px;
     }
 
-    /* reduce spacing around the responsive grids */
     .responsive-grid { margin-bottom: 6px !important; }
 
-    /* --- Frame (border) styles for sections --- */
- .frame {
-  border: 1px solid rgba(0,0,0,0.08);
-  border-radius: 10px;
-  padding: 12px;
-  box-shadow: 0 1px 6px rgba(0,0,0,0.06);
-  background: #e6f7ff; /* slightly stronger pale blue */
-  margin-bottom: 8px;
-}
-   .frame.compact { padding: 8px; border-radius: 8px; margin-bottom:6px; }
+    /* --- Frame styles --- */
+    .frame {
+      border: 1px solid rgba(0,0,0,0.08);
+      border-radius: 10px;
+      padding: 12px;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.06);
+      background: #e6f7ff;
+      margin-bottom: 8px;
+    }
+    .frame.compact { padding: 8px; border-radius: 8px; margin-bottom:6px; }
+
+    /* --- Spa card style --- */
+    .spa-card {
+      background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
+      border-radius: 14px;
+      padding: 18px 20px;
+      color: #fff;
+      margin-bottom: 10px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+    }
+    .spa-card .spa-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #7ecbf7;
+      letter-spacing: 0.03em;
+      margin-bottom: 12px;
+    }
+    .spa-temp-big {
+      font-size: 2.6rem;
+      font-weight: 800;
+      color: #fff;
+      line-height: 1;
+    }
+    .spa-temp-sub {
+      font-size: 0.88rem;
+      color: #a0c8e8;
+      margin-top: 4px;
+    }
+    .spa-badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      margin: 3px 3px 3px 0;
+    }
+    .spa-badge-ok   { background: rgba(40,200,100,0.22); color: #6effa8; border: 1px solid rgba(40,200,100,0.4); }
+    .spa-badge-warn { background: rgba(255,160,0,0.22);  color: #ffd060; border: 1px solid rgba(255,160,0,0.4); }
+    .spa-badge-err  { background: rgba(220,60,60,0.22);  color: #ff8080; border: 1px solid rgba(220,60,60,0.4); }
+    .spa-badge-off  { background: rgba(120,120,120,0.22); color: #ccc;   border: 1px solid rgba(120,120,120,0.3); }
+    .spa-section-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: #7ecbf7;
+      margin-bottom: 5px;
+      margin-top: 12px;
+      font-weight: 600;
+    }
+    .spa-divider { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 10px 0; }
+
+    /* --- Alert banner --- */
+    .alert-banner {
+      background: linear-gradient(90deg, #7b1a1a, #b02020);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #fff;
+      font-weight: 600;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* --- Signal badge in sidebar --- */
+    .signal-badge {
+      display: inline-block;
+      background: #2d8cff;
+      color: #fff;
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
     .frame-header {
       display:flex;
       align-items:center;
@@ -560,20 +573,19 @@ st.markdown(
     .frame-header h2 { margin:0; font-size:1.05rem; font-weight:600; }
     .frame-sub { color:#666; font-size:0.9rem; }
 
-    /* --- Small screen tweaks --- */
     @media (max-width:640px) {
       .frame { padding: 8px; margin-bottom:8px; }
       .frame-header h2 { font-size: 1rem; }
       .responsive-card { padding:6px 8px; min-width: 100px; }
+      .spa-temp-big { font-size: 2rem; }
     }
 
-    /* small hr / separators */
     hr { margin: 6px 0 !important; height: 1px !important; border: none; background: #eee; }
-
     </style>
     """,
     unsafe_allow_html=True,
 )
+
 USER_TZ = ZoneInfo("America/Denver") if ZoneInfo else timezone.utc
 
 # Session
@@ -582,8 +594,8 @@ if "last_auto_refresh" not in st.session_state:
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
-    st.title("Settings")
-    st.subheader("ZIP (location)")
+    st.title("⚙️ Settings")
+    st.subheader("📍 Location")
     saved_zip = config.get("zip_code", DEFAULT_ZIP)
     zip_input = st.text_input("ZIP code (US)", value=saved_zip)
     if st.button("Save ZIP"):
@@ -599,12 +611,12 @@ with st.sidebar:
         else:
             st.info("Enter a ZIP first.")
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("Display")
+    st.subheader("🌡️ Display")
     unit_choice = st.radio("Temp unit", ["°F", "°C"], index=0)
     use_celsius = unit_choice == "°C"
     auto_refresh_enabled = st.checkbox("Auto-refresh", value=False)
     refresh_minutes = st.number_input("Refresh interval (min)", min_value=1, max_value=120, value=10)
-    if st.button("Refresh now"):
+    if st.button("🔄 Refresh now"):
         st.session_state["last_auto_refresh"] = time.time()
         safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
@@ -619,43 +631,68 @@ with st.sidebar:
         st.success("Caches cleared.")
         safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("Enphase (external)")
+    st.subheader("☀️ Enphase")
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase (public)</a>', unsafe_allow_html=True)
+
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    # ----- Arctic Spa sidebar subsection (REPLACED: secrets-only) -----
-    st.subheader("Arctic Spa")
-    st.markdown("Open Arctic Spa site in a new tab, or call the API (requires token).")
+
+    # ----- ntfy alert config in sidebar -----
+    st.subheader("📲 Push Alerts")
+    st.markdown('<span class="signal-badge">via ntfy.sh</span>', unsafe_allow_html=True)
+    st.markdown("""
+**One-time setup:**
+1. Install the **ntfy** app (iOS / Android)
+2. Tap **Subscribe to topic**
+3. Enter your topic name (must match `NTFY_TOPIC` below)
+4. Set `NTFY_TOPIC` in `st.secrets` or env vars
+""")
+    ntfy_configured = bool(NTFY_TOPIC)
+    if ntfy_configured:
+        st.caption(f"✅ Topic configured: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
+    else:
+        st.warning("NTFY_TOPIC not set — using default: `monishas-tub-alerts`")
+
+    if st.button("📨 Send test push notification"):
+        try:
+            send_ntfy_message(NTFY_TOPIC, "Test Alert", "✅ Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
+            st.success(f"Test notification sent to topic: `{NTFY_TOPIC}`")
+        except Exception as exc:
+            st.error(f"Failed: {exc}")
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ----- Arctic Spa sidebar subsection -----
+    st.subheader("🛁 Arctic Spa")
     st.markdown(f'<a href="{ARCTIC_BASE}" target="_blank" rel="noopener noreferrer">Open Arctic Spa portal</a>', unsafe_allow_html=True)
-    st.caption(f"API token can be obtained via the spa portal: {ARCTIC_SPA_PORTAL_HINT}")
+    st.caption(f"API token: {ARCTIC_SPA_PORTAL_HINT}")
     with st.expander("Local login form (manual only)"):
-        st.info("This form is a local convenience only. It does not log into the external site.")
+        st.info("This form is a local convenience only.")
         username = st.text_input("Username", value="", key="local_arctic_username")
         password = st.text_input("Password", value="", type="password", key="local_arctic_password")
         st.checkbox("Remember username for this session", key="remember_local_user")
         if st.button("Show entered username"):
             st.success(f"Username entered: {username or '(empty)'}")
+
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.subheader("Arctic Spas API (client)")
     if not ARCTICSPAS_INSTALLED:
-        st.warning("Package 'arcticspas' not installed. Run 'pip install arcticspas' locally to enable API calls.")
+        st.warning("Package 'arcticspas' not installed. Run 'pip install arcticspas' to enable.")
     token_preview = bool((st.secrets.get("arcticspa", {}) or {}).get("token"))
     if token_preview:
         st.caption("Using token from Streamlit secrets.")
     else:
-        st.warning("No Arctic Spa token found in st.secrets. Provide token to call the API.")
+        st.warning("No Arctic Spa token found in st.secrets.")
     if st.button("Fetch spa status (via secrets)"):
         result = fetch_spa_status_via_service()
         if result["ok"]:
             st.success(f"Status OK — HTTP {result['status_code']}")
             st.json(result["data"])
         else:
-            st.error(f"Failed to fetch spa status: {result['error']}")
+            st.error(f"Failed: {result['error']}")
             if result.get("status_code"):
                 st.write("HTTP status:", result["status_code"])
 
-# ---------------- Layout: compact immediate forecast, compact 5-day, compact spa, Enphase ----------------
-
-# Resolve zip -> coords
+# ---------------- Layout ----------------
 zip_to_use = config.get("zip_code", DEFAULT_ZIP)
 try:
     lat, lon = geocode_zip_to_latlon_cached(zip_to_use)
@@ -663,14 +700,12 @@ except Exception as e:
     st.error(f"Could not geocode ZIP {zip_to_use}: {e}")
     lat = lon = None
 
-# Auto-refresh handling
 if auto_refresh_enabled:
     last = st.session_state.get("last_auto_refresh", 0)
     if time.time() - last >= refresh_minutes * 60:
         st.session_state["last_auto_refresh"] = time.time()
         safe_rerun()
 
-# Fetch weather early
 weather_obj = None
 weather_error = None
 if lat is not None and lon is not None:
@@ -679,8 +714,9 @@ if lat is not None and lon is not None:
     except Exception as e:
         weather_error = str(e)
 
-# ---------------- Hourly helper (updated behaviors 1-5) ----------------
+# ---------------- Hourly helper ----------------
 NUM_HOURLY_TO_SHOW = 6
+
 def get_hourly_slice(hourly_periods: List[dict], now_user: datetime, user_tz) -> List[Tuple[datetime, dict]]:
     parsed = []
     for h in hourly_periods:
@@ -695,16 +731,7 @@ def get_hourly_slice(hourly_periods: List[dict], now_user: datetime, user_tz) ->
             break
     else:
         idx = 0
-    slice_items = parsed[idx: idx + NUM_HOURLY_TO_SHOW]
-    if len(slice_items) < NUM_HOURLLY_TO_SHOW if False else False:
-        # fallback handled below
-        pass
-    if len(slice_items) < NUM_HOURLLY_TO_SHOW if False else False:
-        pass
-    if len(slice_items) < NUM_HOURLLY_TO_SHOW if False else False:
-        pass
-    # fallback padding handled earlier in other code paths; return slice as-is
-    return slice_items
+    return parsed[idx: idx + NUM_HOURLY_TO_SHOW]
 
 def extract_pop(period: dict) -> Optional[int]:
     for key in ("probabilityOfPrecipitation", "pop", "probability"):
@@ -769,22 +796,22 @@ def compute_feels_like_for_period(period: dict, to_celsius_flag: bool) -> Option
 st.markdown(
     """
 <style>
-.compact-small { font-size: 0.86rem; line-height:1; }
-.compact-label { font-size:0.92rem; font-weight:600; margin-bottom:4px; }
+.compact-small  { font-size: 0.86rem; line-height:1.3; }
+.compact-label  { font-size:0.92rem; font-weight:600; margin-bottom:4px; }
 .compact-metric { font-size:1.05rem; font-weight:700; }
-.compact-chip { display:inline-block; padding:4px 8px; border-radius:8px; font-size:0.85rem; margin-right:6px; background:#f1f1f1; }
-.small-icon { width:48px; height:auto; }
+.compact-chip   { display:inline-block; padding:4px 8px; border-radius:8px; font-size:0.85rem;
+                  margin-right:6px; background:#f1f1f1; }
+.small-icon     { width:48px; height:auto; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ---------- Immediate forecast (flex, no clipping) ----------
-st.markdown("## Immediate forecast", unsafe_allow_html=True)
+# ---------- Immediate forecast ----------
 if weather_obj:
     now_user = to_user_tz(now_utc(), USER_TZ)
-    hourly = weather_obj.get("forecastHourly", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecastHourly") else []
-    dayparts = weather_obj.get("forecast", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecast") else []
+    hourly   = weather_obj.get("forecastHourly", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecastHourly") else []
+    dayparts = weather_obj.get("forecast",       {}).get("properties", {}).get("periods", []) if weather_obj.get("forecast")       else []
     display_immediate = hourly if hourly else dayparts
     items = get_hourly_slice(display_immediate, now_user, USER_TZ) or []
     if not items:
@@ -800,87 +827,44 @@ if weather_obj:
             pop = extract_pop(it)
             icon_url = it.get("icon") or get_cached_icon_path(it.get("icon") or "") or ""
             cold_threshold = 0 if use_celsius else 32
-            hot_threshold = 29 if use_celsius else 85
+            hot_threshold  = 29 if use_celsius else 85
             color = "#000"
             if temp_disp is not None:
                 if temp_disp < cold_threshold:
                     color = "#1f77b4"
                 elif temp_disp >= hot_threshold:
                     color = "#d62728"
-
-            # no fixed min-height on the icon container; icon scales with max-width and max-height
-            img_tag = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/> ' if icon_url else ""
+            img_tag    = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/> ' if icon_url else ""
             feels_html = f'<div style="font-size:12px;margin-top:6px">Feels: {feels}°{"C" if use_celsius else "F"}</div>' if feels is not None and feels != temp_disp else ""
-            pop_html = f'<div style="font-size:12px;margin-top:6px">POP: {pop}%</div>' if pop is not None else ""
+            pop_html   = f'<div style="font-size:12px;margin-top:6px">POP: {pop}%</div>' if pop is not None else ""
             card = f'''
             <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:8px 10px;flex:1;min-width:72px;box-sizing:border-box;">
               <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:6px">{label}</div>
               <div style="display:flex;align-items:center;justify-content:center;">{img_tag}</div>
-              <div style="text-align:center;font-weight:700;color:{color};margin-top:8px;font-size:1.02rem">{temp_disp if temp_disp is not None else 'N/A'}°{'C' if use_celsius else 'F'}</div>
+              <div style="text-align:center;font-weight:700;color:{color};margin-top:8px;font-size:1.02rem">{temp_disp if temp_disp is not None else "N/A"}°{"C" if use_celsius else "F"}</div>
               <div style="text-align:center">{feels_html}{pop_html}</div>
             </div>'''
             cards.append(card)
 
-        # Responsive grid for immediate forecast
-        cards_html = ''.join(cards)  # unchanged: your per-card markup list
-
-        immediate_frame_html = f"""
-        <div class="frame">
-          <div class="frame-header">
-            <h2>Immediate forecast</h2>
-            <div class="frame-sub">Next {NUM_HOURLY_TO_SHOW} hours</div>
-          </div>
-
-          <div class="responsive-grid">
-            {cards_html}
-          </div>
-        </div>
-        """
-
-        # tune height to content; choose a value that avoids clipping
-        #st.components.v1.html(immediate_frame_html, height=220, scrolling=True)
-
+        cards_html = ''.join(cards)
         responsive_immediate_html = f"""
         <style>
         .responsive-grid {{
-          display: grid;
-          gap: 10px;
+          display: grid; gap: 10px;
           grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-          align-items: start;
-          width: 100%;
-          box-sizing: border-box;
-          padding: 6px 0;
+          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0;
         }}
-
-        .responsive-card {{
-          display:flex; flex-direction:column; align-items:stretch; justify-content:flex-start;
-          padding:8px 10px; box-sizing:border-box;
-          min-width: 120px;
-        }}
-
-        @media (max-width: 600px) {{
-          .responsive-card {{ padding:6px 8px; min-width: 100px; }}
-          .responsive-card .label {{ font-size:0.9rem; }}
-          .responsive-card .metric {{ font-size:1.0rem; }}
-        }}
-
-        @media (min-width: 1200px) {{
-          .responsive-card {{ min-height:140px; }}
-        }}
+        @media (max-width: 600px) {{ .responsive-grid {{ grid-template-columns: repeat(3, 1fr); }} }}
+        @media (min-width: 1200px) {{ }}
         </style>
-
-        <div class="responsive-grid">
-          {cards_html}
-        </div>
+        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">⏱️ Immediate forecast <span style="font-weight:400;font-size:0.88rem;color:#666">— next {NUM_HOURLY_TO_SHOW} hours</span></div>
+        <div class="responsive-grid">{cards_html}</div>
         """
-
-        # height can be tuned — set to a value that avoids clipping on your content
         st.components.v1.html(responsive_immediate_html, height=220, scrolling=True)
 else:
     st.info("No forecast available.")
 
-# ---------- 5-day forecast (flex, no clipping) ----------
-st.markdown("## 5-day (high / low)", unsafe_allow_html=True)
+# ---------- 5-day forecast ----------
 if weather_obj:
     periods = weather_obj.get("forecast", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecast") else []
     if not periods:
@@ -905,11 +889,9 @@ if weather_obj:
             while len(next_days) < 5:
                 cand = cand + timedelta(days=1)
                 if cand in buckets and cand not in added:
-                    next_days.append(cand)
-                    added.add(cand)
+                    next_days.append(cand); added.add(cand)
                 elif cand not in added and len(next_days) < 5:
-                    next_days.append(cand)
-                    added.add(cand)
+                    next_days.append(cand); added.add(cand)
                 if len(added) > 10:
                     break
 
@@ -917,7 +899,6 @@ if weather_obj:
         for day in next_days:
             bucket = buckets.get(day, [])
             weekday = day.strftime("%a")
-            # icon selection
             icon_url = None
             for it in bucket:
                 p = it["period"]
@@ -926,26 +907,22 @@ if weather_obj:
             if not icon_url:
                 icons = [it["period"].get("icon") for it in bucket if it["period"].get("icon")]
                 if icons:
-                    try:
-                        icon_url = max(set(icons), key=icons.count)
-                    except Exception:
-                        icon_url = icons[0]
+                    try:    icon_url = max(set(icons), key=icons.count)
+                    except: icon_url = icons[0]
             temps_display = []
             for item in bucket:
                 p = item["period"]
-                t = p.get("temperature")
-                unit = p.get("temperatureUnit", "F")
-                td = convert_temp_for_display(t, unit, use_celsius)
+                td = convert_temp_for_display(p.get("temperature"), p.get("temperatureUnit", "F"), use_celsius)
                 if td is not None:
                     temps_display.append(td)
             high = max(temps_display) if temps_display else None
-            low = min(temps_display) if temps_display else None
-            img_tag = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
-            ft = "C" if use_celsius else "F"
-            low_html = f'<span style="color:red">{low}°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}°{ft}" if low is not None else "N/A")
+            low  = min(temps_display) if temps_display else None
+            img_tag  = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
+            ft       = "C" if use_celsius else "F"
+            low_html = f'<span style="color:#e05050">{low}°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}°{ft}" if low is not None else "N/A")
             high_html = f"{high}°{ft}" if high is not None else "N/A"
-            short_texts = [p.get("shortForecast", "") for p in [it["period"] for it in bucket] if p.get("shortForecast")]
-            common = short_texts and (max(set(short_texts), key=short_texts.count) if short_texts else "")
+            short_texts = [p.get("shortForecast","") for p in [it["period"] for it in bucket] if p.get("shortForecast")]
+            common = max(set(short_texts), key=short_texts.count) if short_texts else ""
             card = f'''
             <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:8px 10px;flex:1;min-width:72px;box-sizing:border-box;">
               <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:6px">{weekday}</div>
@@ -956,170 +933,326 @@ if weather_obj:
             </div>'''
             cards.append(card)
 
-        # Responsive grid for 5-day forecast
-        cards_html = ''.join(cards)  # this is your 5-day cards list
-
-        five_day_frame_html = f"""
-        <div class="frame">
-          <div class="frame-header">
-            <h2>5-day (high / low)</h2>
-            <div class="frame-sub">Daily highs & lows</div>
-          </div>
-
-          <div class="responsive-grid">
-            {cards_html}
-          </div>
-        </div>
-        """
-
-        #st.components.v1.html(five_day_frame_html, height=260, scrolling=True)
-
+        cards_html = ''.join(cards)
         responsive_5day_html = f"""
         <style>
         .responsive-grid {{
-          display: grid;
-          gap: 10px;
+          display: grid; gap: 10px;
           grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-          align-items: start;
-          width: 100%;
-          box-sizing: border-box;
-          padding: 6px 0;
-        }}
-        .responsive-card {{ padding:8px 10px; box-sizing:border-box; min-width:130px; }}
-
-        @media (max-width: 640px) {{
-          .responsive-card {{ padding:6px 8px; min-width:110px; }}
-          .responsive-card .label {{ font-size:0.9rem; }}
+          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0;
         }}
         </style>
-
-        <div class="responsive-grid">
-          {cards_html}
-        </div>
+        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">📅 5-day forecast <span style="font-weight:400;font-size:0.88rem;color:#666">— daily high / low</span></div>
+        <div class="responsive-grid">{cards_html}</div>
         """
-
         st.components.v1.html(responsive_5day_html, height=260, scrolling=True)
 else:
     st.info("No forecast available.")
-# ---------- Compact Arctic Spa status (compressed) ----------
-# open frame
-st.markdown("<div class='frame'>", unsafe_allow_html=True)
 
-# header row inside frame
-st.markdown("<div class='frame-header'><h2>Monisha's Tub — Live status</h2><div class='frame-sub'>Live spa data</div></div>", unsafe_allow_html=True)
-
-# now render the same Streamlit columns / content you had (unchanged)
+# ---------- Arctic Spa Status (redesigned dark card) ----------
 spa_result = fetch_spa_status_via_service()
 
-if not spa_result.get("ok"):
-    st.info("Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
-else:
-    # ... existing code that creates st.columns and the status UI ...
-    # keep it unchanged
-
-# close frame
-    st.markdown("</div>", unsafe_allow_html=True)
+# open frame
+st.markdown("<div class='frame' style='background:#f0f4f8;'>", unsafe_allow_html=True)
 
 if not spa_result.get("ok"):
-    st.info("Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
+    st.info("🛁 Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
 else:
-    spa = spa_result.get("data") or {}
+    # ---------- DEV TEST: quick spa override ----------
+    # Uncomment one of the spa_test assignments below to simulate conditions that should trigger the alert.
+
+    # TEST CASE 1: temperature below 4°F
+    #spa_test = {"temperatureF": 3.0, "setpointF": 100.0, "connected": True, "pump1": "on", "pump2": "on", "pump3": "on", "filter_status": "ok", "ph": 7.4, "ph_status": "ok", "orp": 650, "orp_status": "ok", "errors": []}
+
+    # TEST CASE 2: a health flag is not OK (pump1 off)
+    #spa_test = {"temperatureF": 100.0, "setpointF": 100.0, "connected": True, "pump1": "off", "pump2": "on", "pump3": "on", "filter_status": "ok", "ph": 7.4, "ph_status": "ok", "orp": 650, "orp_status": "ok", "errors": []}
+
+    # TEST CASE 3: disconnected + error list
+    #spa_test = {"temperatureF": 100.0, "setpointF": 100.0, "connected": False, "pump1": "on", "pump2": "on", "pump3": "on", "filter_status": "ok", "ph": None, "ph_status": None, "orp": None, "orp_status": None, "errors": ["sensor failure"]}
+
+    try:
+        spa_test  # noqa: F821
+    except NameError:
+        spa_test = None
+
+    if spa_test is not None:
+        spa = spa_test
+    else:
+        spa = spa_result.get("data") or {}
+
     if not isinstance(spa, dict):
         try:
             spa = spa.to_dict() if hasattr(spa, "to_dict") else json.loads(json.dumps(spa, default=lambda o: getattr(o, "__dict__", str(o))))
         except Exception:
-            try:
-                spa = dict(spa)
-            except Exception:
-                spa = {}
-    temp = spa.get("temperatureF") or spa.get("temperature") or spa.get("temp")
-    setpoint = spa.get("setpointF") or spa.get("setpoint")
-    connected = spa.get("connected")
-    lights = spa.get("lights")
-    pump1 = spa.get("pump1")
-    pump2 = spa.get("pump2")
-    pump3 = spa.get("pump3")
-    filter_status = spa.get("filter_status") or spa.get("filterStatus")
+            try:    spa = dict(spa)
+            except: spa = {}
+
+    temp               = spa.get("temperatureF") or spa.get("temperature") or spa.get("temp")
+    setpoint           = spa.get("setpointF") or spa.get("setpoint")
+    connected          = spa.get("connected")
+    lights             = spa.get("lights")
+    pump1              = spa.get("pump1")
+    pump2              = spa.get("pump2")
+    pump3              = spa.get("pump3")
+    filter_status      = spa.get("filter_status") or spa.get("filterStatus")
     filtration_frequency = spa.get("filtration_frequency")
-    filtration_duration = spa.get("filtration_duration")
-    ph = spa.get("ph")
-    ph_status = spa.get("ph_status")
-    orp = spa.get("orp")
-    orp_status = spa.get("orp_status")
-    spaboy_connected = spa.get("spaboy_connected")
-    spaboy_producing = spa.get("spaboy_producing")
-    errors = spa.get("errors") or []
+    filtration_duration  = spa.get("filtration_duration")
+    ph                 = spa.get("ph")
+    ph_status          = spa.get("ph_status")
+    orp                = spa.get("orp")
+    orp_status         = spa.get("orp_status")
+    spaboy_connected   = spa.get("spaboy_connected")
+    spaboy_producing   = spa.get("spaboy_producing")
+    errors             = spa.get("errors") or []
 
-    # Row A: Temperature, setpoint, connection
-    a1, a2, a3 = st.columns([1.4, 1, 1], gap="small")
-    with a1:
+    # ---------- Automated alerting via ntfy.sh ----------
+    # Alerts trigger on: temp < 4F, spa disconnected, explicit error statuses, or spa-reported errors.
+    # Pumps being "off" is NORMAL — they cycle. Unknown/None values are NOT alert conditions.
+    def _is_error_status(val):
+        """Only returns True for explicit error/fault values. None, off, unknown = not an alert."""
+        if val is None:
+            return False
+        try:
+            s = str(val).strip().lower()
+            return s in ("error", "critical", "fault", "failed", "failure", "alarm", "danger")
+        except Exception:
+            return False
+
+    temp_val = None
+    try:
         if temp is not None:
-            st.markdown("<div class='compact-label'>Water temperature</div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='compact-metric'>{temp} °F</div>", unsafe_allow_html=True)
-            if setpoint is not None:
-                st.markdown(f"<div class='compact-small'>Setpoint: {setpoint} °F</div>", unsafe_allow_html=True)
-        else:
-            st.markdown("<div class='compact-small'>Temperature: N/A</div>", unsafe_allow_html=True)
-    with a2:
-        st.markdown("<div class='compact-label'>Connection</div>", unsafe_allow_html=True)
-        conn = "🟢 Connected" if connected else "🔴 Disconnected"
-        st.markdown(f"<div class='compact-small'>{conn}</div>", unsafe_allow_html=True)
-        sb = []
-        if spaboy_connected:
-            sb.append("Spaboy connected")
-        if spaboy_producing:
-            sb.append("producing")
-        if sb:
-            st.markdown(f"<div class='compact-small'>{', '.join(sb)}</div>", unsafe_allow_html=True)
-    with a3:
-        st.markdown("<div class='compact-label'>Lights / Filter</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='compact-small'>Lights: {lights or 'unknown'}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='compact-small'>Filter: {filter_status or 'unknown'}</div>", unsafe_allow_html=True)
+            temp_val = float(temp)
+    except Exception:
+        temp_val = None
 
-    # Row B: Pumps and filtration and chemistry
-    bcols = st.columns(4, gap="small")
-    with bcols[0]:
-        st.markdown("<div class='compact-label'>Pumps</div>", unsafe_allow_html=True)
-        st.markdown(f"<span class='compact-chip'>P1: {pump1 or 'unknown'}</span><span class='compact-chip'>P2: {pump2 or 'unknown'}</span><span class='compact-chip'>P3: {pump3 or 'unknown'}</span>", unsafe_allow_html=True)
-    with bcols[1]:
-        st.markdown("<div class='compact-label'>Filtration</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='compact-small'>Freq: {filtration_frequency or '?'} /day</div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='compact-small'>Dur: {filtration_duration or '?'} min</div>", unsafe_allow_html=True)
-    with bcols[2]:
-        st.markdown("<div class='compact-label'>pH</div>", unsafe_allow_html=True)
-        ph_text = f"{ph}" if ph is not None else "N/A"
-        st.markdown(f"<div class='compact-small'>Value: {ph_text} ({ph_status or 'unknown'})</div>", unsafe_allow_html=True)
-    with bcols[3]:
-        st.markdown("<div class='compact-label'>ORP</div>", unsafe_allow_html=True)
-        orp_text = f"{orp}" if orp is not None else "N/A"
-        st.markdown(f"<div class='compact-small'>Value: {orp_text} ({orp_status or 'unknown'})</div>", unsafe_allow_html=True)
+    other_not_ok = False
+    reasons: List[str] = []
 
-    # Errors (small)
+    # Spa disconnected — cannot monitor
+    if connected is False:
+        other_not_ok = True; reasons.append("spa disconnected")
+
+    # Status fields — only alert on explicit error values, not off/unknown/None
+    if _is_error_status(filter_status):
+        other_not_ok = True; reasons.append(f"filter_status={filter_status}")
+    if _is_error_status(ph_status):
+        other_not_ok = True; reasons.append(f"ph_status={ph_status}")
+    if _is_error_status(orp_status):
+        other_not_ok = True; reasons.append(f"orp_status={orp_status}")
+
+    # Explicit errors reported by the spa
     if errors:
-        st.markdown("<div class='compact-label'>Errors / Alerts</div>", unsafe_allow_html=True)
-        for e in errors:
-            st.markdown(f"<div class='compact-small' style='color:#b00020'>&#9888; {e}</div>", unsafe_allow_html=True)
+        other_not_ok = True; reasons.append(f"spa errors: {errors}")
+
+    # If current temp is more than 4°F below the setpoint — try to restore setpoint via API, then alert
+    setpoint_val = None
+    try:
+        if setpoint is not None:
+            setpoint_val = float(setpoint)
+    except Exception:
+        setpoint_val = None
+
+    temp_below_setpoint = (
+        temp_val is not None
+        and setpoint_val is not None
+        and temp_val < (setpoint_val - 4.0)
+    )
+    trigger_alert = other_not_ok or temp_below_setpoint
+
+    # If temp is below setpoint threshold, try to re-apply the setpoint via the API
+    temp_reset_result = None
+    if temp_below_setpoint:
+        spa_id = spa.get("id") or spa.get("spa_id") or spa.get("spaId") or ""
+        if spa_id and setpoint_val is not None:
+            # API expects Celsius
+            setpoint_c = (setpoint_val - 32.0) * 5.0 / 9.0
+            try:
+                temp_reset_result = _call_temperature_set(spa_id, setpoint_c)
+            except Exception as exc:
+                temp_reset_result = {"ok": False, "error": str(exc)}
+        else:
+            temp_reset_result = {"ok": False, "error": "spa_id or setpoint not available"}
+
+    alert_sent_recently = False
+    if "last_spa_alert" in st.session_state:
+        try:
+            if time.time() - float(st.session_state["last_spa_alert"]) < 3600:
+                alert_sent_recently = True
+        except Exception:
+            alert_sent_recently = False
+
+    if trigger_alert and not alert_sent_recently:
+        ts = datetime.now(timezone.utc).astimezone(USER_TZ).strftime("%Y-%m-%d %H:%M %Z")
+        alert_title = "Spa Alert: Monisha's Tub"
+        trigger_desc = f"temp {temp_val}F is >4F below setpoint {setpoint_val}F" if temp_below_setpoint else "health indicator"
+        reset_line = ""
+        if temp_reset_result is not None:
+            if temp_reset_result.get("ok"):
+                reset_line = f"Action: setpoint re-applied ({setpoint_val} F)"
+            else:
+                reset_line = f"Action: failed to re-apply setpoint — {temp_reset_result.get('error')}"
+        message_lines = [
+            f"Time: {ts}",
+            f"Temp: {temp_val if temp_val is not None else 'N/A'} F  |  Setpoint: {setpoint_val or 'N/A'} F",
+            f"Trigger: {trigger_desc}",
+        ]
+        if reset_line:
+            message_lines.append(reset_line)
+        message_lines += [
+            f"Issues: {', '.join(reasons) if reasons else 'none'}",
+            f"Conn: {'OK' if connected else 'DISCONNECTED'}  P1:{pump1} P2:{pump2} P3:{pump3}",
+            f"Filter: {filter_status}  |  pH: {ph} ({ph_status})  |  ORP: {orp} ({orp_status})",
+            f"Errors: {errors or 'none'}",
+        ]
+        ntfy_message = "\n".join(message_lines)
+
+        try:
+            send_ntfy_message(NTFY_TOPIC, alert_title, ntfy_message, server=NTFY_SERVER,
+                              priority="urgent", tags="warning,bathtub")
+            st.success(f"📲 Push alert sent to ntfy topic: `{NTFY_TOPIC}`")
+            st.session_state["last_spa_alert"] = time.time()
+        except Exception as exc:
+            st.error(f"Failed to send ntfy alert: {exc}")
+            st.caption("Check NTFY_TOPIC and NTFY_SERVER in st.secrets or env vars.")
+
+        if temp_reset_result is not None:
+            if temp_reset_result.get("ok"):
+                st.success(f"Setpoint re-applied: {setpoint_val} F")
+            else:
+                st.warning(f"Could not re-apply setpoint: {temp_reset_result.get('error')}")
+
+    elif trigger_alert and alert_sent_recently:
+        st.info("⚠️ Alert condition present but an alert was sent recently (rate-limited to 1/hr).")
+
+    # ---------- Redesigned spa card UI ----------
+    # Show alert banner if triggered
+    if trigger_alert:
+        problems_str = " · ".join(reasons) if reasons else ("temp < 4°F" if temp_too_low else "unknown")
+        st.markdown(f'<div class="alert-banner">⚠️ Alert condition detected — {problems_str}</div>', unsafe_allow_html=True)
+
+    # Helper: badge class
+    def badge_class(val, ok_vals=("on", "ok", "true", "1", "connected"), warn_vals=("low", "high", "slow")):
+        if val is None: return "spa-badge-off"
+        s = str(val).strip().lower()
+        if s in ok_vals:   return "spa-badge-ok"
+        if s in warn_vals: return "spa-badge-warn"
+        if s in ("off", "false", "0", "disabled", "disconnected", "error"): return "spa-badge-err"
+        return "spa-badge-off"
+
+    conn_class  = "spa-badge-ok" if connected else "spa-badge-err"
+    conn_label  = "Connected" if connected else "Disconnected"
+    temp_color  = "#ff6060" if (temp_val is not None and temp_val < 4) else "#7ef7c8"
+
+    def pump_badge(val, num):
+        cls = badge_class(val)
+        return f'<span class="spa-badge {cls}">P{num}: {val or "?"}</span>'
+
+    def chem_badge(val, status):
+        cls = badge_class(status)
+        display = f"{val}" if val is not None else "N/A"
+        return f'<span class="spa-badge {cls}">{display} <span style="font-size:0.75em">({status or "?"})</span></span>'
+
+    spaboy_html = ""
+    if spaboy_connected is not None:
+        sb_cls = "spa-badge-ok" if spaboy_connected else "spa-badge-off"
+        sp_label = "SpaBoy " + ("connected" if spaboy_connected else "disconnected")
+        if spaboy_producing:
+            sp_label += " · producing"
+        spaboy_html = f'<span class="spa-badge {sb_cls}">{sp_label}</span>'
+
+    lights_cls = badge_class(lights)
+    filter_cls = badge_class(filter_status)
+
+    errors_html = ""
+    if errors:
+        err_items = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">⚠ {e}</div>' for e in errors)
+        errors_html = f'<hr class="spa-divider"><div class="spa-section-label">Errors / Alerts</div>{err_items}'
     else:
-        st.markdown("<div class='compact-small'>No active errors.</div>", unsafe_allow_html=True)
+        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">✅ No active errors</div>'
+
+    filtration_html = ""
+    if filtration_frequency or filtration_duration:
+        filtration_html = f'<span class="spa-badge spa-badge-off">Freq: {filtration_frequency or "?"}/day &nbsp;|&nbsp; Dur: {filtration_duration or "?"} min</span>'
+
+    spa_card_html = f"""
+    <div class="spa-card">
+      <div class="spa-title">🛁 Monisha's Tub — Live Status</div>
+
+      <div style="display:flex;align-items:flex-end;gap:24px;flex-wrap:wrap;">
+        <div>
+          <div class="spa-temp-big" style="color:{temp_color}">{temp if temp is not None else "—"} °F</div>
+          <div class="spa-temp-sub">Setpoint: {setpoint or "—"} °F</div>
+        </div>
+        <div style="padding-bottom:4px">
+          <span class="spa-badge {conn_class}">{conn_label}</span>
+          {spaboy_html}
+        </div>
+      </div>
+
+      <hr class="spa-divider">
+
+      <div class="spa-section-label">Pumps</div>
+      {pump_badge(pump1, 1)} {pump_badge(pump2, 2)} {pump_badge(pump3, 3)}
+
+      <div class="spa-section-label">Lights &amp; Filter</div>
+      <span class="spa-badge {lights_cls}">Lights: {lights or "?"}</span>
+      <span class="spa-badge {filter_cls}">Filter: {filter_status or "?"}</span>
+      {filtration_html}
+
+      <div class="spa-section-label">Water Chemistry</div>
+      {chem_badge(ph, ph_status)} &nbsp; {chem_badge(orp, orp_status)}
+
+      {errors_html}
+    </div>
+    """
+
+    st.components.v1.html(
+        f"""
+        <style>
+        .spa-card {{ background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
+          border-radius: 14px; padding: 18px 20px; color: #fff; margin-bottom: 10px;
+          box-shadow: 0 4px 18px rgba(0,0,0,0.18); font-family: sans-serif; }}
+        .spa-title {{ font-size: 1.05rem; font-weight: 700; color: #7ecbf7; letter-spacing: 0.03em; margin-bottom: 12px; }}
+        .spa-temp-big {{ font-size: 2.6rem; font-weight: 800; line-height: 1; }}
+        .spa-temp-sub {{ font-size: 0.88rem; color: #a0c8e8; margin-top: 4px; }}
+        .spa-badge {{ display:inline-block; padding:4px 10px; border-radius:20px; font-size:0.8rem; font-weight:600; margin:3px 3px 3px 0; }}
+        .spa-badge-ok   {{ background:rgba(40,200,100,0.22);  color:#6effa8; border:1px solid rgba(40,200,100,0.4); }}
+        .spa-badge-warn {{ background:rgba(255,160,0,0.22);   color:#ffd060; border:1px solid rgba(255,160,0,0.4); }}
+        .spa-badge-err  {{ background:rgba(220,60,60,0.22);   color:#ff8080; border:1px solid rgba(220,60,60,0.4); }}
+        .spa-badge-off  {{ background:rgba(120,120,120,0.22); color:#ccc;    border:1px solid rgba(120,120,120,0.3); }}
+        .spa-section-label {{ font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em; color:#7ecbf7; margin-bottom:5px; margin-top:12px; font-weight:600; }}
+        .spa-divider {{ border:none; border-top:1px solid rgba(255,255,255,0.08); margin:10px 0; }}
+        .alert-banner {{ background:linear-gradient(90deg,#7b1a1a,#b02020); border-radius:8px; padding:10px 14px; color:#fff; font-weight:600; margin-bottom:10px; }}
+        </style>
+        {spa_card_html}
+        """,
+        height=420,
+        scrolling=False,
+    )
 
     # raw toggle
-    with st.expander("Raw spa payload (compact debug)"):
+    with st.expander("Raw spa payload (debug)"):
         st.json(spa)
 
-# ---------- Enphase iframe (kept last) ----------
+# close frame
+st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------- Enphase iframe ----------
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-st.markdown("## Enphase Solar Panels Info")
+st.markdown("## ☀️ Enphase Solar Panels")
 try:
     st.components.v1.iframe(ENPHASE_PUBLIC_URL, height=540)
 except Exception:
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase hour graph (public)</a>', unsafe_allow_html=True)
-st.markdown(f'If embedding is blocked, open in a new tab: <a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase</a>', unsafe_allow_html=True)
+st.markdown(f'If embedding is blocked: <a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open in new tab</a>', unsafe_allow_html=True)
 
-# Footer debug
+# Footer
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-st.caption("Compact layout: hourly starts at next full hour; first shown hour labeled 'Now' if within 60 minutes. Feels-like, POP, and color-coded temps included.")
+st.caption("Compact layout · Hourly starts at next full hour · First shown hour labeled 'Now' if within 60 min · Feels-like, POP & color-coded temps · Alerts via ntfy.sh")
 if st.checkbox("Show debug"):
     st.write("config:", config)
     st.write("zip:", zip_to_use)
     st.write("last_auto_refresh:", st.session_state.get("last_auto_refresh"))
     st.write("arcticspas installed:", ARCTICSPAS_INSTALLED)
+    st.write("ntfy topic:", NTFY_TOPIC)
+    st.write("ntfy server:", NTFY_SERVER)
