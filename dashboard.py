@@ -10,6 +10,8 @@ Streamlit app (dense mode) with improved hourly forecast behavior and Arctic Spa
 - Enphase iframe (650px)
 - Arctic Spas client integration (optional; requires arcticspas package and token)
 - Alerts sent via ntfy.sh (free push notifications, no account needed)
+- PUMP RUNTIME TRACKING: daily runtime per pump, persisted across refreshes in session_state
+- CHEMISTRY RANGE INDICATORS: visual pH and ORP range bars
 
 ntfy alert setup (one-time):
   1. Install the "ntfy" app on your phone (iOS or Android)
@@ -36,60 +38,40 @@ from datetime import datetime, timezone, timedelta, date
 
 
 # ---------- ntfy.sh alert config & helper ----------
-# ntfy is a free, no-account push notification service: https://ntfy.sh
-# Setup:
-#   1. Install the "ntfy" app on iOS or Android
-#   2. Subscribe to your topic (e.g. "monishas-tub-alerts") inside the app
-#   3. Set NTFY_TOPIC (and optionally NTFY_SERVER) in st.secrets or env vars
-
 NTFY_TOPIC  = st.secrets.get("NTFY_TOPIC",  None) or os.environ.get("NTFY_TOPIC")  or "monishas-tub-alerts"
 NTFY_SERVER = st.secrets.get("NTFY_SERVER", None) or os.environ.get("NTFY_SERVER") or "https://ntfy.sh"
 
 def _ascii_safe(s: str) -> str:
-    """Strip any characters outside latin-1 range (for HTTP headers)."""
     return s.encode("latin-1", errors="ignore").decode("latin-1")
 
 def send_ntfy_message(topic: str, title: str, message: str, server: str = NTFY_SERVER,
                       priority: str = "high", tags: str = "warning,bathtub") -> None:
-    """
-    Send a push notification via ntfy.sh (or self-hosted ntfy server).
-    Raises RuntimeError on failure.
-    Docs: https://docs.ntfy.sh/publish/
-    """
     if not topic:
-        raise ValueError("NTFY_TOPIC is not set. Add it to st.secrets or env vars.")
+        raise ValueError("NTFY_TOPIC is not set.")
     url = f"{server.rstrip('/')}/{topic}"
-    # HTTP headers must be latin-1 safe — strip emoji/unicode from title
     headers = {
         "Title":        _ascii_safe(title),
         "Priority":     priority,
         "Tags":         tags,
         "Content-Type": "text/plain; charset=utf-8",
     }
-    # message body is sent as UTF-8 bytes so emoji are fine there
     resp = requests.post(url, data=message.encode("utf-8"), headers=headers, timeout=15)
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"ntfy returned HTTP {resp.status_code}: {resp.text[:200]}")
 
-# optional zoneinfo
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-# ---------------- Single-file Arctic Spas helpers (secrets-only) ----------------
 try:
-    import arcticspas  # type: ignore
+    import arcticspas
     ARCTICSPAS_INSTALLED = True
 except Exception:
     ARCTICSPAS_INSTALLED = False
 
 @st.cache_resource
 def _get_spa_config_from_secrets() -> Optional[Dict[str, str]]:
-    """
-    Return {'token': ..., 'base_url': ...} or None.
-    Cached to avoid repeated st.secrets access, but does NOT cache a Client object.
-    """
     try:
         secrets = st.secrets.get("arcticspa", {}) or {}
         token = secrets.get("token")
@@ -101,10 +83,6 @@ def _get_spa_config_from_secrets() -> Optional[Dict[str, str]]:
         return None
 
 def fetch_spa_status_via_service() -> Dict[str, Any]:
-    """
-    Create a fresh Client for this call using config from st.secrets.
-    Returns dict: {ok, status_code, data, error}
-    """
     cfg = _get_spa_config_from_secrets()
     if cfg is None:
         if not ARCTICSPAS_INSTALLED:
@@ -115,7 +93,7 @@ def fetch_spa_status_via_service() -> Dict[str, Any]:
         from arcticspas.api.spa_control import v2_spa
     except Exception:
         try:
-            from arcticspas.operations import v2_spa  # type: ignore
+            from arcticspas.operations import v2_spa
         except Exception as exc:
             return {"ok": False, "status_code": None, "data": None, "error": f"Could not import spa operation: {exc}"}
 
@@ -133,7 +111,7 @@ def fetch_spa_status_via_service() -> Dict[str, Any]:
             data = None
             if parsed is None:
                 try:
-                    data = resp.json()  # type: ignore
+                    data = resp.json()
                 except Exception:
                     data = None
             else:
@@ -158,7 +136,7 @@ def _call_temperature_set(spa_id: str, temperature_c: float) -> Dict[str, Any]:
         from arcticspas.api import v2_temperature
     except Exception:
         try:
-            from arcticspas.operations import v2_temperature  # type: ignore
+            from arcticspas.operations import v2_temperature
         except Exception as exc:
             return {"ok": False, "error": f"temperature op import failed: {exc}"}
     try:
@@ -187,7 +165,7 @@ def _call_light_set(spa_id: str, light_id: str, on: bool) -> Dict[str, Any]:
         from arcticspas.api import v2_light
     except Exception:
         try:
-            from arcticspas.operations import v2_light  # type: ignore
+            from arcticspas.operations import v2_light
         except Exception as exc:
             return {"ok": False, "error": f"light op import failed: {exc}"}
     try:
@@ -201,9 +179,8 @@ def _call_light_set(spa_id: str, light_id: str, on: bool) -> Dict[str, Any]:
             body = {"state": "on" if on else "off"}
             resp = v2_light.sync_detailed(client=c, spa_id=spa_id, light_id=light_id, json_body=body)
             status_code = getattr(resp, "status_code", None)
-            parsed = getattr(resp, "parsed", None)
             ok = 200 <= (status_code or 0) < 400
-            return {"ok": ok, "status_code": status_code, "data": parsed, "error": None if ok else f"HTTP {status_code}"}
+            return {"ok": ok, "status_code": status_code, "data": getattr(resp, "parsed", None), "error": None if ok else f"HTTP {status_code}"}
     except Exception as exc:
         return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 
@@ -216,7 +193,7 @@ def _call_pump_set(spa_id: str, pump_id: str, speed: int) -> Dict[str, Any]:
         from arcticspas.api import v2_pump
     except Exception:
         try:
-            from arcticspas.operations import v2_pump  # type: ignore
+            from arcticspas.operations import v2_pump
         except Exception as exc:
             return {"ok": False, "error": f"pump op import failed: {exc}"}
     try:
@@ -230,9 +207,8 @@ def _call_pump_set(spa_id: str, pump_id: str, speed: int) -> Dict[str, Any]:
             body = {"speed": speed}
             resp = v2_pump.sync_detailed(client=c, spa_id=spa_id, pump_id=pump_id, json_body=body)
             status_code = getattr(resp, "status_code", None)
-            parsed = getattr(resp, "parsed", None)
             ok = 200 <= (status_code or 0) < 400
-            return {"ok": ok, "status_code": status_code, "data": parsed, "error": None if ok else f"HTTP {status_code}"}
+            return {"ok": ok, "status_code": status_code, "data": getattr(resp, "parsed", None), "error": None if ok else f"HTTP {status_code}"}
     except Exception as exc:
         return {"ok": False, "status_code": None, "data": None, "error": str(exc)}
 
@@ -245,6 +221,11 @@ DEFAULT_ZIP = "84124"
 ENPHASE_PUBLIC_URL = "https://enlighten.enphaseenergy.com/mobile/HRDg1683634/history/graph/hours?public=1"
 ARCTIC_BASE = "https://api.myarcticspa.com"
 ARCTIC_SPA_PORTAL_HINT = "https://myarcticspa.com/spa/SpaAPIManagement.aspx"
+
+# Chemistry safe ranges
+PH_MIN,  PH_MAX  = 7.2, 7.8
+ORP_MIN, ORP_MAX = 600, 800
+TEMP_MIN_F, TEMP_MAX_F = 95.0, 104.0  # typical spa operating range (°F)
 
 # ---------------- Utilities ----------------
 def safe_rerun():
@@ -265,7 +246,6 @@ def now_utc() -> datetime:
 def chunked_hash(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-# ---------------- Network helper ----------------
 def retry_request(method: str, url: str, **kwargs) -> requests.Response:
     max_attempts = 3
     backoff = 0.8
@@ -284,7 +264,6 @@ def retry_request(method: str, url: str, **kwargs) -> requests.Response:
             time.sleep(backoff * attempt)
     raise RuntimeError("Failed after retries")
 
-# ---------------- Icon caching ----------------
 @st.cache_data(ttl=86400)
 def get_cached_icon_path(icon_url: str) -> Optional[str]:
     if not icon_url:
@@ -306,7 +285,6 @@ def get_cached_icon_path(icon_url: str) -> Optional[str]:
     except Exception:
         return None
 
-# ---------------- Persistence ----------------
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
         try:
@@ -332,7 +310,6 @@ def clear_config() -> None:
 
 config = load_config()
 
-# ---------------- Time helpers ----------------
 def parse_iso_to_dt(iso_ts: str) -> Optional[datetime]:
     if not iso_ts:
         return None
@@ -363,7 +340,6 @@ def format_time_short(dt_user: datetime) -> str:
     except Exception:
         return dt_user.strftime("%I %p").lstrip("0")
 
-# ---------------- Temperature conversion & feels-like ----------------
 def convert_temp_for_display(temp_value: Any, from_unit: str, to_celsius: bool) -> Optional[int]:
     try:
         t = float(temp_value)
@@ -394,18 +370,13 @@ def parse_wind_mph(wind_str: str) -> Optional[float]:
         return None
 
 def compute_wind_chill(temp_f: float, wind_mph: float) -> float:
-    wc = 35.74 + 0.6215*temp_f - 35.75*(wind_mph**0.16) + 0.4275*temp_f*(wind_mph**0.16)
-    return wc
+    return 35.74 + 0.6215*temp_f - 35.75*(wind_mph**0.16) + 0.4275*temp_f*(wind_mph**0.16)
 
 def compute_heat_index(temp_f: float, rh: float) -> float:
-    T = temp_f
-    R = rh
-    HI = (-42.379 + 2.04901523*T + 10.14333127*R - 0.22475541*T*R - 6.83783e-3*(T**2)
-          - 5.481717e-2*(R**2) + 1.22874e-3*(T**2)*R + 8.5282e-4*T*(R**2)
-          - 1.99e-6*(T**2)*(R**2))
-    return HI
+    T, R = temp_f, rh
+    return (-42.379 + 2.04901523*T + 10.14333127*R - 0.22475541*T*R - 6.83783e-3*(T**2)
+            - 5.481717e-2*(R**2) + 1.22874e-3*(T**2)*R + 8.5282e-4*T*(R**2) - 1.99e-6*(T**2)*(R**2))
 
-# ---------------- Cached API calls ----------------
 @st.cache_data(ttl=86400)
 def geocode_zip_to_latlon_cached(zip_code: str) -> Tuple[float, float]:
     resp = retry_request("GET", f"https://api.zippopotam.us/us/{zip_code}", timeout=8)
@@ -424,8 +395,7 @@ def get_nws_forecast_cached(lat: float, lon: float) -> dict:
     point = r.json()
     forecast_url = point["properties"].get("forecast")
     forecast_hourly_url = point["properties"].get("forecastHourly")
-    forecast = None
-    forecast_hourly = None
+    forecast = forecast_hourly = None
     if forecast_url:
         rf = retry_request("GET", forecast_url, headers=headers, timeout=10)
         rf.raise_for_status()
@@ -436,161 +406,220 @@ def get_nws_forecast_cached(lat: float, lon: float) -> dict:
         forecast_hourly = rh.json()
     return {"point": point, "forecast": forecast, "forecastHourly": forecast_hourly}
 
-# ---------------- App start ----------------
+
+# ============================================================
+# PUMP RUNTIME TRACKING
+# ============================================================
+# We track per-pump runtime in session_state using these keys:
+#   pump_state_{n}           : last known state string ("on"/"off"/None)
+#   pump_on_since_{n}        : timestamp (time.time()) when pump turned on
+#   pump_daily_seconds_{n}   : accumulated seconds today
+#   pump_runtime_date        : date string for today — used to reset daily totals
+#
+# On each app run we:
+#   1. Check if the date rolled over → reset all daily_seconds to 0
+#   2. Compare new pump state vs saved state:
+#      - off→on  : record pump_on_since
+#      - on→on   : accumulate (time.time() - pump_on_since) into daily_seconds, reset pump_on_since
+#      - on→off  : finalize accumulated time, clear pump_on_since
+#      - off→off : nothing
+# ============================================================
+
+def _is_pump_on(val) -> bool:
+    """Return True if pump value indicates running (on / speed>0 / etc.)."""
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    if s in ("on", "1", "true", "running", "high", "low", "medium"):
+        return True
+    try:
+        return float(s) > 0
+    except Exception:
+        return False
+
+def _today_str(user_tz) -> str:
+    return datetime.now(user_tz).strftime("%Y-%m-%d")
+
+def _reset_daily_state(today: str) -> None:
+    """Reset all daily-tracked values when the date rolls over."""
+    for n in [1, 2, 3]:
+        st.session_state[f"pump_daily_seconds_{n}"] = 0
+        st.session_state[f"pump_on_since_{n}"]      = None
+        st.session_state[f"pump_state_{n}"]         = None
+    for key in ("temp", "ph", "orp"):
+        st.session_state[f"chem_min_{key}"] = None
+        st.session_state[f"chem_max_{key}"] = None
+    st.session_state["pump_runtime_date"] = today
+
+
+def update_pump_runtimes(pump_vals: Dict[int, Any], user_tz) -> None:
+    """
+    Call once per app load with the latest pump state values.
+    pump_vals: {1: pump1_val, 2: pump2_val, 3: pump3_val}
+    Mutates st.session_state in-place.
+    """
+    today  = _today_str(user_tz)
+    now_ts = time.time()
+
+    if st.session_state.get("pump_runtime_date") != today:
+        _reset_daily_state(today)
+
+    for n in [1, 2, 3]:
+        new_val   = pump_vals.get(n)
+        new_on    = _is_pump_on(new_val)
+        prev_on   = _is_pump_on(st.session_state.get(f"pump_state_{n}"))
+        on_since  = st.session_state.get(f"pump_on_since_{n}")
+        daily_sec = st.session_state.get(f"pump_daily_seconds_{n}", 0)
+
+        if new_on and prev_on:
+            if on_since is not None:
+                daily_sec += now_ts - on_since
+            st.session_state[f"pump_daily_seconds_{n}"] = daily_sec
+            st.session_state[f"pump_on_since_{n}"]      = now_ts
+        elif new_on and not prev_on:
+            st.session_state[f"pump_on_since_{n}"] = now_ts
+        elif not new_on and prev_on:
+            if on_since is not None:
+                daily_sec += now_ts - on_since
+            st.session_state[f"pump_daily_seconds_{n}"] = daily_sec
+            st.session_state[f"pump_on_since_{n}"]      = None
+
+        st.session_state[f"pump_state_{n}"] = new_val
+
+
+def update_chem_ranges(temp_f: Optional[float], ph: Optional[float], orp: Optional[float]) -> None:
+    """Update daily min/max for temp, ph, orp in session_state."""
+    for key, val in (("temp", temp_f), ("ph", ph), ("orp", orp)):
+        if val is None:
+            continue
+        cur_min = st.session_state.get(f"chem_min_{key}")
+        cur_max = st.session_state.get(f"chem_max_{key}")
+        st.session_state[f"chem_min_{key}"] = val if cur_min is None else min(cur_min, val)
+        st.session_state[f"chem_max_{key}"] = val if cur_max is None else max(cur_max, val)
+
+
+def get_pump_runtime_display(n: int) -> str:
+    """
+    Returns formatted runtime string for pump n, including live accumulation.
+    """
+    now_ts    = time.time()
+    daily_sec = st.session_state.get(f"pump_daily_seconds_{n}", 0)
+    on_since  = st.session_state.get(f"pump_on_since_{n}")
+    if on_since is not None:
+        daily_sec += now_ts - on_since
+
+    hours   = int(daily_sec // 3600)
+    minutes = int((daily_sec % 3600) // 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m"
+
+
+def chem_inline_html(label: str, value: Optional[float], unit: str,
+                     safe_lo: float, safe_hi: float,
+                     day_min: Optional[float], day_max: Optional[float],
+                     fmt: str = ".1f") -> str:
+    """
+    Compact single-line: label · value [today lo–hi]
+    Value color: green if within safe range, red if outside.
+    Bracket shows today's observed min–max (resets midnight).
+    If only one reading so far, shows that single value for both ends.
+    """
+    if value is None:
+        return f'<span style="color:#6a8eaa;font-size:0.82rem">{label}: N/A</span>'
+    in_range  = safe_lo <= value <= safe_hi
+    val_color = "#6effa8" if in_range else "#ff6060"
+    val_str   = f"{value:{fmt}}"
+    if day_min is not None and day_max is not None:
+        range_str = f"{day_min:{fmt}}–{day_max:{fmt}}"
+    else:
+        range_str = "—"
+    return (f'<span style="font-size:0.82rem;color:#a0c8e8">{label}:</span> '
+            f'<span style="font-weight:700;color:{val_color}">{val_str}{unit}</span> '
+            f'<span style="font-size:0.74rem;color:#4a6a80">[{range_str}]</span>')
+
+
+# ============================================================
+# App start
+# ============================================================
 st.set_page_config(layout="wide", page_title="Forecast Dashboard", initial_sidebar_state="expanded")
 
-st.markdown(
-    """
-    <style>
-    /* --- Compact app spacing & typography (global) --- */
-    h2 {
-      font-size: 1.1rem !important;
-      margin-top: 6px !important;
-      margin-bottom: 6px !important;
-    }
+st.markdown("""
+<style>
+h2 { font-size: 1.1rem !important; margin-top: 6px !important; margin-bottom: 6px !important; }
+.stMarkdown p { margin: 6px 0 !important; }
+.block-container > div { padding-top: 6px !important; padding-bottom: 6px !important; }
 
-    .stMarkdown p { margin: 6px 0 !important; }
-    .block-container > div { padding-top: 6px !important; padding-bottom: 6px !important; }
+.responsive-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0; margin: 0;
+}
+.responsive-card {
+  display:flex; flex-direction:column; align-items:stretch;
+  justify-content:flex-start; padding:8px 10px; box-sizing:border-box;
+  min-width: 120px; margin-bottom: 4px;
+}
+.frame {
+  border: 1px solid rgba(0,0,0,0.08); border-radius: 10px; padding: 12px;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.06); background: #e6f7ff; margin-bottom: 8px;
+}
+.frame.compact { padding: 8px; border-radius: 8px; margin-bottom:6px; }
 
-    /* --- Responsive grid / card helpers --- */
-    .responsive-grid {
-      display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      align-items: start;
-      width: 100%;
-      box-sizing: border-box;
-      padding: 6px 0;
-      margin: 0;
-    }
-
-    .responsive-card {
-      display:flex;
-      flex-direction:column;
-      align-items:stretch;
-      justify-content:flex-start;
-      padding:8px 10px;
-      box-sizing:border-box;
-      min-width: 120px;
-      margin-bottom: 4px;
-    }
-
-    .responsive-grid { margin-bottom: 6px !important; }
-
-    /* --- Frame styles --- */
-    .frame {
-      border: 1px solid rgba(0,0,0,0.08);
-      border-radius: 10px;
-      padding: 12px;
-      box-shadow: 0 1px 6px rgba(0,0,0,0.06);
-      background: #e6f7ff;
-      margin-bottom: 8px;
-    }
-    .frame.compact { padding: 8px; border-radius: 8px; margin-bottom:6px; }
-
-    /* --- Spa card style --- */
-    .spa-card {
-      background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
-      border-radius: 14px;
-      padding: 18px 20px;
-      color: #fff;
-      margin-bottom: 10px;
-      box-shadow: 0 4px 18px rgba(0,0,0,0.18);
-    }
-    .spa-card .spa-title {
-      font-size: 1.05rem;
-      font-weight: 700;
-      color: #7ecbf7;
-      letter-spacing: 0.03em;
-      margin-bottom: 12px;
-    }
-    .spa-temp-big {
-      font-size: 2.6rem;
-      font-weight: 800;
-      color: #fff;
-      line-height: 1;
-    }
-    .spa-temp-sub {
-      font-size: 0.88rem;
-      color: #a0c8e8;
-      margin-top: 4px;
-    }
-    .spa-badge {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 20px;
-      font-size: 0.8rem;
-      font-weight: 600;
-      margin: 3px 3px 3px 0;
-    }
-    .spa-badge-ok   { background: rgba(40,200,100,0.22); color: #6effa8; border: 1px solid rgba(40,200,100,0.4); }
-    .spa-badge-warn { background: rgba(255,160,0,0.22);  color: #ffd060; border: 1px solid rgba(255,160,0,0.4); }
-    .spa-badge-err  { background: rgba(220,60,60,0.22);  color: #ff8080; border: 1px solid rgba(220,60,60,0.4); }
-    .spa-badge-off  { background: rgba(120,120,120,0.22); color: #ccc;   border: 1px solid rgba(120,120,120,0.3); }
-    .spa-section-label {
-      font-size: 0.78rem;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-      color: #7ecbf7;
-      margin-bottom: 5px;
-      margin-top: 12px;
-      font-weight: 600;
-    }
-    .spa-divider { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 10px 0; }
-
-    /* --- Alert banner --- */
-    .alert-banner {
-      background: linear-gradient(90deg, #7b1a1a, #b02020);
-      border-radius: 8px;
-      padding: 10px 14px;
-      color: #fff;
-      font-weight: 600;
-      margin-bottom: 10px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    /* --- Signal badge in sidebar --- */
-    .signal-badge {
-      display: inline-block;
-      background: #2d8cff;
-      color: #fff;
-      border-radius: 6px;
-      padding: 2px 8px;
-      font-size: 0.8rem;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-    }
-
-    .frame-header {
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-      margin-bottom:8px;
-    }
-    .frame-header h2 { margin:0; font-size:1.05rem; font-weight:600; }
-    .frame-sub { color:#666; font-size:0.9rem; }
-
-    @media (max-width:640px) {
-      .frame { padding: 8px; margin-bottom:8px; }
-      .frame-header h2 { font-size: 1rem; }
-      .responsive-card { padding:6px 8px; min-width: 100px; }
-      .spa-temp-big { font-size: 2rem; }
-    }
-
-    hr { margin: 6px 0 !important; height: 1px !important; border: none; background: #eee; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+/* Spa card */
+.spa-card {
+  background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
+  border-radius: 14px; padding: 18px 20px; color: #fff;
+  margin-bottom: 10px; box-shadow: 0 4px 18px rgba(0,0,0,0.18);
+}
+.spa-card .spa-title {
+  font-size: 1.05rem; font-weight: 700; color: #7ecbf7;
+  letter-spacing: 0.03em; margin-bottom: 12px;
+}
+.spa-temp-big { font-size: 2.6rem; font-weight: 800; color: #fff; line-height: 1; }
+.spa-temp-sub { font-size: 0.88rem; color: #a0c8e8; margin-top: 4px; }
+.spa-badge {
+  display: inline-block; padding: 4px 10px; border-radius: 20px;
+  font-size: 0.8rem; font-weight: 600; margin: 3px 3px 3px 0;
+}
+.spa-badge-ok   { background: rgba(40,200,100,0.22);  color: #6effa8; border: 1px solid rgba(40,200,100,0.4); }
+.spa-badge-warn { background: rgba(255,160,0,0.22);   color: #ffd060; border: 1px solid rgba(255,160,0,0.4); }
+.spa-badge-err  { background: rgba(220,60,60,0.22);   color: #ff8080; border: 1px solid rgba(220,60,60,0.4); }
+.spa-badge-off  { background: rgba(120,120,120,0.22); color: #ccc;    border: 1px solid rgba(120,120,120,0.3); }
+.spa-section-label {
+  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.07em;
+  color: #7ecbf7; margin-bottom: 5px; margin-top: 12px; font-weight: 600;
+}
+.spa-divider { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 10px 0; }
+.alert-banner {
+  background: linear-gradient(90deg, #7b1a1a, #b02020);
+  border-radius: 8px; padding: 10px 14px; color: #fff;
+  font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
+}
+.signal-badge {
+  display: inline-block; background: #2d8cff; color: #fff;
+  border-radius: 6px; padding: 2px 8px; font-size: 0.8rem; font-weight: 700; letter-spacing: 0.04em;
+}
+hr { margin: 6px 0 !important; height: 1px !important; border: none; background: #eee; }
+</style>
+""", unsafe_allow_html=True)
 
 USER_TZ = ZoneInfo("America/Denver") if ZoneInfo else timezone.utc
 
-# Session
 if "last_auto_refresh" not in st.session_state:
     st.session_state["last_auto_refresh"] = time.time()
+
+# Initialise runtime session keys
+for _n in [1, 2, 3]:
+    for _k in [f"pump_daily_seconds_{_n}", f"pump_on_since_{_n}", f"pump_state_{_n}"]:
+        if _k not in st.session_state:
+            st.session_state[_k] = None if "_state_" in _k or "_since_" in _k else 0
+if "pump_runtime_date" not in st.session_state:
+    st.session_state["pump_runtime_date"] = ""
+for _k in ("temp", "ph", "orp"):
+    for _prefix in ("chem_min_", "chem_max_"):
+        if _prefix + _k not in st.session_state:
+            st.session_state[_prefix + _k] = None
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -630,41 +659,38 @@ with st.sidebar:
         st.cache_data.clear()
         st.success("Caches cleared.")
         safe_rerun()
+    if st.button("Reset pump runtimes"):
+        for _n in [1, 2, 3]:
+            st.session_state[f"pump_daily_seconds_{_n}"] = 0
+            st.session_state[f"pump_on_since_{_n}"]      = None
+        for _k in ("temp", "ph", "orp"):
+            st.session_state[f"chem_min_{_k}"] = None
+            st.session_state[f"chem_max_{_k}"] = None
+        st.session_state["pump_runtime_date"] = ""
+        st.success("Pump runtimes and chemistry ranges reset.")
+        safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.subheader("☀️ Enphase")
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase (public)</a>', unsafe_allow_html=True)
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-    # ----- ntfy alert config in sidebar -----
     st.subheader("📲 Push Alerts")
     st.markdown('<span class="signal-badge">via ntfy.sh</span>', unsafe_allow_html=True)
-    st.markdown("""
-**One-time setup:**
-1. Install the **ntfy** app (iOS / Android)
-2. Tap **Subscribe to topic**
-3. Enter your topic name (must match `NTFY_TOPIC` below)
-4. Set `NTFY_TOPIC` in `st.secrets` or env vars
-""")
     ntfy_configured = bool(NTFY_TOPIC)
     if ntfy_configured:
-        st.caption(f"✅ Topic configured: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
+        st.caption(f"✅ Topic: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
     else:
-        st.warning("NTFY_TOPIC not set — using default: `monishas-tub-alerts`")
-
+        st.warning("NTFY_TOPIC not set — using default.")
     if st.button("📨 Send test push notification"):
         try:
             send_ntfy_message(NTFY_TOPIC, "Test Alert", "✅ Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
-            st.success(f"Test notification sent to topic: `{NTFY_TOPIC}`")
+            st.success(f"Test notification sent to: `{NTFY_TOPIC}`")
         except Exception as exc:
             st.error(f"Failed: {exc}")
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-    # ----- Arctic Spa sidebar subsection -----
     st.subheader("🛁 Arctic Spa")
     st.markdown(f'<a href="{ARCTIC_BASE}" target="_blank" rel="noopener noreferrer">Open Arctic Spa portal</a>', unsafe_allow_html=True)
-    st.caption(f"API token: {ARCTIC_SPA_PORTAL_HINT}")
     with st.expander("Local login form (manual only)"):
         st.info("This form is a local convenience only.")
         username = st.text_input("Username", value="", key="local_arctic_username")
@@ -676,7 +702,7 @@ with st.sidebar:
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     st.subheader("Arctic Spas API (client)")
     if not ARCTICSPAS_INSTALLED:
-        st.warning("Package 'arcticspas' not installed. Run 'pip install arcticspas' to enable.")
+        st.warning("Package 'arcticspas' not installed.")
     token_preview = bool((st.secrets.get("arcticspa", {}) or {}).get("token"))
     if token_preview:
         st.caption("Using token from Streamlit secrets.")
@@ -689,8 +715,6 @@ with st.sidebar:
             st.json(result["data"])
         else:
             st.error(f"Failed: {result['error']}")
-            if result.get("status_code"):
-                st.write("HTTP status:", result["status_code"])
 
 # ---------------- Layout ----------------
 zip_to_use = config.get("zip_code", DEFAULT_ZIP)
@@ -714,10 +738,9 @@ if lat is not None and lon is not None:
     except Exception as e:
         weather_error = str(e)
 
-# ---------------- Hourly helper ----------------
 NUM_HOURLY_TO_SHOW = 6
 
-def get_hourly_slice(hourly_periods: List[dict], now_user: datetime, user_tz) -> List[Tuple[datetime, dict]]:
+def get_hourly_slice(hourly_periods, now_user, user_tz):
     parsed = []
     for h in hourly_periods:
         dt = parse_iso_to_dt(h.get("startTime"))
@@ -729,11 +752,9 @@ def get_hourly_slice(hourly_periods: List[dict], now_user: datetime, user_tz) ->
         if dt_user > now_user:
             idx = i
             break
-    else:
-        idx = 0
     return parsed[idx: idx + NUM_HOURLY_TO_SHOW]
 
-def extract_pop(period: dict) -> Optional[int]:
+def extract_pop(period):
     for key in ("probabilityOfPrecipitation", "pop", "probability"):
         v = period.get(key)
         if v is None:
@@ -748,15 +769,9 @@ def extract_pop(period: dict) -> Optional[int]:
             return int(float(v))
         except Exception:
             continue
-    try:
-        v = period.get("probabilityOfPrecipitation", {}).get("value")
-        if v is not None:
-            return int(float(v))
-    except Exception:
-        pass
     return None
 
-def compute_feels_like_for_period(period: dict, to_celsius_flag: bool) -> Optional[int]:
+def compute_feels_like_for_period(period, to_celsius_flag):
     t = period.get("temperature")
     unit = period.get("temperatureUnit", "F")
     if t is None:
@@ -767,34 +782,21 @@ def compute_feels_like_for_period(period: dict, to_celsius_flag: bool) -> Option
         return None
     wind_str = period.get("windSpeed") or ""
     wind_mph = parse_wind_mph(wind_str) or 0.0
-    rh = None
     rh_raw = period.get("relativeHumidity") or period.get("humidity") or period.get("probabilityOfPrecipitation")
-    if isinstance(rh_raw, dict):
-        rh = rh_raw.get("value")
-    else:
-        rh = rh_raw
+    rh = rh_raw.get("value") if isinstance(rh_raw, dict) else rh_raw
     try:
         rh_val = float(rh) if rh is not None else None
     except Exception:
         rh_val = None
-    feels_f = None
     if temp_f <= 50 and wind_mph >= 3:
-        try:
-            feels_f = compute_wind_chill(temp_f, wind_mph)
-        except Exception:
-            feels_f = temp_f
+        feels_f = compute_wind_chill(temp_f, wind_mph)
     elif temp_f >= 80 and rh_val is not None:
-        try:
-            feels_f = compute_heat_index(temp_f, rh_val)
-        except Exception:
-            feels_f = temp_f
+        feels_f = compute_heat_index(temp_f, rh_val)
     else:
         feels_f = temp_f
     return convert_temp_for_display(feels_f, "F", to_celsius_flag)
 
-# ---------- Compact UI CSS ----------
-st.markdown(
-    """
+st.markdown("""
 <style>
 .compact-small  { font-size: 0.86rem; line-height:1.3; }
 .compact-label  { font-size:0.92rem; font-weight:600; margin-bottom:4px; }
@@ -803,11 +805,9 @@ st.markdown(
                   margin-right:6px; background:#f1f1f1; }
 .small-icon     { width:48px; height:auto; }
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# ---------- Immediate forecast ----------
+# ---------- Hourly forecast ----------
 if weather_obj:
     now_user = to_user_tz(now_utc(), USER_TZ)
     hourly   = weather_obj.get("forecastHourly", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecastHourly") else []
@@ -825,7 +825,7 @@ if weather_obj:
             temp_disp = convert_temp_for_display(temp, unit, use_celsius)
             feels = compute_feels_like_for_period(it, use_celsius)
             pop = extract_pop(it)
-            icon_url = it.get("icon") or get_cached_icon_path(it.get("icon") or "") or ""
+            icon_url = it.get("icon") or ""
             cold_threshold = 0 if use_celsius else 32
             hot_threshold  = 29 if use_celsius else 85
             color = "#000"
@@ -845,31 +845,25 @@ if weather_obj:
               <div style="text-align:center">{feels_html}{pop_html}</div>
             </div>'''
             cards.append(card)
-
         cards_html = ''.join(cards)
-        responsive_immediate_html = f"""
+        st.components.v1.html(f"""
         <style>
-        .responsive-grid {{
-          display: grid; gap: 10px;
+        .responsive-grid {{ display: grid; gap: 10px;
           grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0;
-        }}
+          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0; }}
         @media (max-width: 600px) {{ .responsive-grid {{ grid-template-columns: repeat(3, 1fr); }} }}
-        @media (min-width: 1200px) {{ }}
         </style>
-        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">⏱️ Immediate forecast <span style="font-weight:400;font-size:0.88rem;color:#666">— next {NUM_HOURLY_TO_SHOW} hours</span></div>
+        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">⏱️ Immediate forecast
+          <span style="font-weight:400;font-size:0.88rem;color:#666">— next {NUM_HOURLY_TO_SHOW} hours</span></div>
         <div class="responsive-grid">{cards_html}</div>
-        """
-        st.components.v1.html(responsive_immediate_html, height=220, scrolling=True)
+        """, height=220, scrolling=True)
 else:
     st.info("No forecast available.")
 
 # ---------- 5-day forecast ----------
 if weather_obj:
     periods = weather_obj.get("forecast", {}).get("properties", {}).get("periods", []) if weather_obj.get("forecast") else []
-    if not periods:
-        st.info("No daypart forecast data available.")
-    else:
+    if periods:
         parsed_periods = []
         for p in periods:
             dt = parse_iso_to_dt(p.get("startTime") or p.get("endTime") or "")
@@ -883,18 +877,6 @@ if weather_obj:
             buckets.setdefault(day, []).append({"period": p, "dt": dt_local})
         today_local = to_user_tz(now_utc(), USER_TZ).date()
         next_days = [d for d in sorted(buckets.keys()) if d >= today_local][:5]
-        if len(next_days) < 5:
-            cand = today_local
-            added = set(next_days)
-            while len(next_days) < 5:
-                cand = cand + timedelta(days=1)
-                if cand in buckets and cand not in added:
-                    next_days.append(cand); added.add(cand)
-                elif cand not in added and len(next_days) < 5:
-                    next_days.append(cand); added.add(cand)
-                if len(added) > 10:
-                    break
-
         cards = []
         for day in next_days:
             bucket = buckets.get(day, [])
@@ -907,8 +889,7 @@ if weather_obj:
             if not icon_url:
                 icons = [it["period"].get("icon") for it in bucket if it["period"].get("icon")]
                 if icons:
-                    try:    icon_url = max(set(icons), key=icons.count)
-                    except: icon_url = icons[0]
+                    icon_url = max(set(icons), key=icons.count)
             temps_display = []
             for item in bucket:
                 p = item["period"]
@@ -917,9 +898,9 @@ if weather_obj:
                     temps_display.append(td)
             high = max(temps_display) if temps_display else None
             low  = min(temps_display) if temps_display else None
-            img_tag  = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
-            ft       = "C" if use_celsius else "F"
-            low_html = f'<span style="color:#e05050">{low}°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}°{ft}" if low is not None else "N/A")
+            img_tag   = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
+            ft        = "C" if use_celsius else "F"
+            low_html  = f'<span style="color:#e05050">{low}°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}°{ft}" if low is not None else "N/A")
             high_html = f"{high}°{ft}" if high is not None else "N/A"
             short_texts = [p.get("shortForecast","") for p in [it["period"] for it in bucket] if p.get("shortForecast")]
             common = max(set(short_texts), key=short_texts.count) if short_texts else ""
@@ -932,53 +913,38 @@ if weather_obj:
               <div style="text-align:center;font-size:11px;margin-top:6px;color:#444">{(common or '')[:36]}</div>
             </div>'''
             cards.append(card)
-
         cards_html = ''.join(cards)
-        responsive_5day_html = f"""
+        st.components.v1.html(f"""
         <style>
-        .responsive-grid {{
-          display: grid; gap: 10px;
+        .responsive-grid {{ display: grid; gap: 10px;
           grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0;
-        }}
+          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0; }}
         </style>
-        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">📅 5-day forecast <span style="font-weight:400;font-size:0.88rem;color:#666">— daily high / low</span></div>
+        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">📅 5-day forecast
+          <span style="font-weight:400;font-size:0.88rem;color:#666">— daily high / low</span></div>
         <div class="responsive-grid">{cards_html}</div>
-        """
-        st.components.v1.html(responsive_5day_html, height=260, scrolling=True)
-else:
-    st.info("No forecast available.")
+        """, height=260, scrolling=True)
 
-# ---------- Arctic Spa Status (redesigned dark card) ----------
+# ============================================================
+# Arctic Spa Status Card (with runtime + range bars)
+# ============================================================
 spa_result = fetch_spa_status_via_service()
 
-# open frame
 st.markdown("<div class='frame' style='background:#f0f4f8;'>", unsafe_allow_html=True)
 
 if not spa_result.get("ok"):
     st.info("🛁 Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
 else:
-    # ---------- DEV TEST: quick spa override ----------
-    # Uncomment one of the spa_test assignments below to simulate conditions that should trigger the alert.
-
-    # TEST CASE 1: temperature below 4°F
-    #spa_test = {"temperatureF": 3.0, "setpointF": 100.0, "connected": True, "pump1": "on", "pump2": "on", "pump3": "on", "filter_status": "ok", "ph": 7.4, "ph_status": "ok", "orp": 650, "orp_status": "ok", "errors": []}
-
-    # TEST CASE 2: a health flag is not OK (pump1 off)
-    #spa_test = {"temperatureF": 100.0, "setpointF": 100.0, "connected": True, "pump1": "off", "pump2": "on", "pump3": "on", "filter_status": "ok", "ph": 7.4, "ph_status": "ok", "orp": 650, "orp_status": "ok", "errors": []}
-
-    # TEST CASE 3: disconnected + error list
-    #spa_test = {"temperatureF": 100.0, "setpointF": 100.0, "connected": False, "pump1": "on", "pump2": "on", "pump3": "on", "filter_status": "ok", "ph": None, "ph_status": None, "orp": None, "orp_status": None, "errors": ["sensor failure"]}
-
+    # DEV TEST overrides — uncomment to simulate:
+    # spa_test = {"temperatureF": 3.0,   "setpointF": 100.0, "connected": True,  "pump1": "on",  "pump2": "off", "pump3": "on",  "filter_status": "ok",    "ph": 7.4, "ph_status": "ok",    "orp": 650, "orp_status": "ok",    "errors": []}
+    # spa_test = {"temperatureF": 100.0, "setpointF": 100.0, "connected": True,  "pump1": "off", "pump2": "on",  "pump3": "on",  "filter_status": "ok",    "ph": 8.1, "ph_status": "high",  "orp": 550, "orp_status": "low",   "errors": []}
+    # spa_test = {"temperatureF": 100.0, "setpointF": 100.0, "connected": False, "pump1": "on",  "pump2": "on",  "pump3": "on",  "filter_status": "error", "ph": None,"ph_status": None,    "orp": None,"orp_status": None,    "errors": ["sensor failure"]}
     try:
         spa_test  # noqa: F821
     except NameError:
         spa_test = None
 
-    if spa_test is not None:
-        spa = spa_test
-    else:
-        spa = spa_result.get("data") or {}
+    spa = spa_test if spa_test is not None else (spa_result.get("data") or {})
 
     if not isinstance(spa, dict):
         try:
@@ -1005,20 +971,17 @@ else:
     spaboy_producing   = spa.get("spaboy_producing")
     errors             = spa.get("errors") or []
 
-    # ---------- Automated alerting via ntfy.sh ----------
-    # Alerts trigger on: temp < 4F, spa disconnected, explicit error statuses, or spa-reported errors.
-    # Pumps being "off" is NORMAL — they cycle. Unknown/None values are NOT alert conditions.
+    # ---- Update pump runtimes ----
+    update_pump_runtimes({1: pump1, 2: pump2, 3: pump3}, USER_TZ)
+
+    # ---- Alert logic ----
     def _is_error_status(val):
-        """Only returns True for explicit error/fault/out-of-range values. None, off, unknown = not an alert."""
         if val is None:
             return False
-        try:
-            s = str(val).strip().lower()
-            return s in ("error", "critical", "fault", "failed", "failure", "alarm", "danger",
-                         "high", "low", "too_high", "too_low", "toohigh", "toolow",
-                         "out_of_range", "outofrange", "warning")
-        except Exception:
-            return False
+        s = str(val).strip().lower()
+        return s in ("error", "critical", "fault", "failed", "failure", "alarm", "danger",
+                     "high", "low", "too_high", "too_low", "toohigh", "toolow",
+                     "out_of_range", "outofrange", "warning")
 
     temp_val = None
     try:
@@ -1027,18 +990,11 @@ else:
     except Exception:
         temp_val = None
 
-    # Safe range constants — adjust here if needed
-    PH_MIN,  PH_MAX  = 7.2, 7.8      # ideal spa pH range
-    ORP_MIN, ORP_MAX = 600, 800       # ideal ORP range (mV)
-
     other_not_ok = False
     reasons: List[str] = []
 
-    # Spa disconnected — cannot monitor
     if connected is False:
         other_not_ok = True; reasons.append("spa disconnected")
-
-    # Status fields — alert on explicit error/high/low values from the API
     if _is_error_status(filter_status):
         other_not_ok = True; reasons.append(f"filter_status={filter_status}")
     if _is_error_status(ph_status):
@@ -1046,7 +1002,6 @@ else:
     if _is_error_status(orp_status):
         other_not_ok = True; reasons.append(f"orp_status={orp_status}")
 
-    # Numeric pH range check (7.2 – 7.8)
     ph_val = None
     try:
         if ph is not None:
@@ -1055,11 +1010,10 @@ else:
         ph_val = None
     if ph_val is not None:
         if ph_val < PH_MIN:
-            other_not_ok = True; reasons.append(f"pH too low: {ph_val:.2f} (min {PH_MIN})")
+            other_not_ok = True; reasons.append(f"pH too low: {ph_val:.2f}")
         elif ph_val > PH_MAX:
-            other_not_ok = True; reasons.append(f"pH too high: {ph_val:.2f} (max {PH_MAX})")
+            other_not_ok = True; reasons.append(f"pH too high: {ph_val:.2f}")
 
-    # Numeric ORP range check (600 – 800 mV)
     orp_val = None
     try:
         if orp is not None:
@@ -1068,15 +1022,16 @@ else:
         orp_val = None
     if orp_val is not None:
         if orp_val < ORP_MIN:
-            other_not_ok = True; reasons.append(f"ORP too low: {orp_val:.0f} mV (min {ORP_MIN})")
+            other_not_ok = True; reasons.append(f"ORP too low: {orp_val:.0f} mV")
         elif orp_val > ORP_MAX:
-            other_not_ok = True; reasons.append(f"ORP too high: {orp_val:.0f} mV (max {ORP_MAX})")
+            other_not_ok = True; reasons.append(f"ORP too high: {orp_val:.0f} mV")
 
-    # Explicit errors reported by the spa
+    # ---- Update daily min/max for chemistry values ----
+    update_chem_ranges(temp_val, ph_val, orp_val)
+
     if errors:
         other_not_ok = True; reasons.append(f"spa errors: {errors}")
 
-    # If current temp is more than 4°F below the setpoint — try to restore setpoint via API, then alert
     setpoint_val = None
     try:
         if setpoint is not None:
@@ -1085,18 +1040,15 @@ else:
         setpoint_val = None
 
     temp_below_setpoint = (
-        temp_val is not None
-        and setpoint_val is not None
+        temp_val is not None and setpoint_val is not None
         and temp_val < (setpoint_val - 4.0)
     )
     trigger_alert = other_not_ok or temp_below_setpoint
 
-    # If temp is below setpoint threshold, try to re-apply the setpoint via the API
     temp_reset_result = None
     if temp_below_setpoint:
         spa_id = spa.get("id") or spa.get("spa_id") or spa.get("spaId") or ""
         if spa_id and setpoint_val is not None:
-            # API expects Celsius
             setpoint_c = (setpoint_val - 32.0) * 5.0 / 9.0
             try:
                 temp_reset_result = _call_temperature_set(spa_id, setpoint_c)
@@ -1111,7 +1063,7 @@ else:
             if time.time() - float(st.session_state["last_spa_alert"]) < 3600:
                 alert_sent_recently = True
         except Exception:
-            alert_sent_recently = False
+            pass
 
     if trigger_alert and not alert_sent_recently:
         ts = datetime.now(timezone.utc).astimezone(USER_TZ).strftime("%Y-%m-%d %H:%M %Z")
@@ -1119,33 +1071,28 @@ else:
         trigger_desc = f"temp {temp_val}F is >4F below setpoint {setpoint_val}F" if temp_below_setpoint else "health indicator"
         reset_line = ""
         if temp_reset_result is not None:
-            if temp_reset_result.get("ok"):
-                reset_line = f"Action: setpoint re-applied ({setpoint_val} F)"
-            else:
-                reset_line = f"Action: failed to re-apply setpoint — {temp_reset_result.get('error')}"
+            reset_line = f"Action: setpoint re-applied ({setpoint_val} F)" if temp_reset_result.get("ok") else f"Action: failed to re-apply — {temp_reset_result.get('error')}"
+        # Include pump runtimes in alert
+        p1_rt = get_pump_runtime_display(1)
+        p2_rt = get_pump_runtime_display(2)
+        p3_rt = get_pump_runtime_display(3)
         message_lines = [
             f"Time: {ts}",
             f"Temp: {temp_val if temp_val is not None else 'N/A'} F  |  Setpoint: {setpoint_val or 'N/A'} F",
             f"Trigger: {trigger_desc}",
-        ]
-        if reset_line:
-            message_lines.append(reset_line)
-        message_lines += [
+            *(([reset_line]) if reset_line else []),
             f"Issues: {', '.join(reasons) if reasons else 'none'}",
-            f"Conn: {'OK' if connected else 'DISCONNECTED'}  P1:{pump1} P2:{pump2} P3:{pump3}",
+            f"Conn: {'OK' if connected else 'DISCONNECTED'}  P1:{pump1} ({p1_rt}) P2:{pump2} ({p2_rt}) P3:{pump3} ({p3_rt})",
             f"Filter: {filter_status}  |  pH: {ph} ({ph_status})  |  ORP: {orp} ({orp_status})",
             f"Errors: {errors or 'none'}",
         ]
-        ntfy_message = "\n".join(message_lines)
-
         try:
-            send_ntfy_message(NTFY_TOPIC, alert_title, ntfy_message, server=NTFY_SERVER,
-                              priority="urgent", tags="warning,bathtub")
+            send_ntfy_message(NTFY_TOPIC, alert_title, "\n".join(message_lines),
+                              server=NTFY_SERVER, priority="urgent", tags="warning,bathtub")
             st.success(f"📲 Push alert sent to ntfy topic: `{NTFY_TOPIC}`")
             st.session_state["last_spa_alert"] = time.time()
         except Exception as exc:
             st.error(f"Failed to send ntfy alert: {exc}")
-            st.caption("Check NTFY_TOPIC and NTFY_SERVER in st.secrets or env vars.")
 
         if temp_reset_result is not None:
             if temp_reset_result.get("ok"):
@@ -1154,35 +1101,26 @@ else:
                 st.warning(f"Could not re-apply setpoint: {temp_reset_result.get('error')}")
 
     elif trigger_alert and alert_sent_recently:
-        st.info("⚠️ Alert condition present but an alert was sent recently (rate-limited to 1/hr).")
+        st.info("⚠️ Alert condition present but rate-limited (1/hr).")
 
-    # ---------- Redesigned spa card UI ----------
-    # Show alert banner if triggered
+    # ---- Build spa card HTML ----
     if trigger_alert:
-        problems_str = " · ".join(reasons) if reasons else ("temp < 4°F" if temp_too_low else "unknown")
-        st.markdown(f'<div class="alert-banner">⚠️ Alert condition detected — {problems_str}</div>', unsafe_allow_html=True)
+        problems_str = " · ".join(reasons) if reasons else "temp below setpoint"
+        alert_banner = f'<div class="alert-banner">⚠️ Alert condition detected — {problems_str}</div>'
+    else:
+        alert_banner = ""
 
-    # Helper: badge class
-    def badge_class(val, ok_vals=("on", "ok", "true", "1", "connected"), warn_vals=("low", "high", "slow")):
+    def badge_class(val, ok_vals=("on","ok","true","1","connected"), warn_vals=("low","high","slow")):
         if val is None: return "spa-badge-off"
         s = str(val).strip().lower()
         if s in ok_vals:   return "spa-badge-ok"
         if s in warn_vals: return "spa-badge-warn"
-        if s in ("off", "false", "0", "disabled", "disconnected", "error"): return "spa-badge-err"
+        if s in ("off","false","0","disabled","disconnected","error"): return "spa-badge-err"
         return "spa-badge-off"
 
     conn_class  = "spa-badge-ok" if connected else "spa-badge-err"
     conn_label  = "Connected" if connected else "Disconnected"
     temp_color  = "#ff6060" if (temp_val is not None and temp_val < 4) else "#7ef7c8"
-
-    def pump_badge(val, num):
-        cls = badge_class(val)
-        return f'<span class="spa-badge {cls}">P{num}: {val or "?"}</span>'
-
-    def chem_badge(val, status):
-        cls = badge_class(status)
-        display = f"{val}" if val is not None else "N/A"
-        return f'<span class="spa-badge {cls}">{display} <span style="font-size:0.75em">({status or "?"})</span></span>'
 
     spaboy_html = ""
     if spaboy_connected is not None:
@@ -1206,10 +1144,37 @@ else:
     if filtration_frequency or filtration_duration:
         filtration_html = f'<span class="spa-badge spa-badge-off">Freq: {filtration_frequency or "?"}/day &nbsp;|&nbsp; Dur: {filtration_duration or "?"} min</span>'
 
+    # ---- Pump runtime inline ----
+    def pump_inline(n, pval):
+        rt    = get_pump_runtime_display(n)
+        is_on = _is_pump_on(pval)
+        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"●" if is_on else "○"}</span>'
+        st_lbl = str(pval or "off")
+        return (f'<span style="color:#a0c8e8;font-size:0.82rem">P{n}</span> {dot} '
+                f'<span style="font-size:0.82rem;color:#ccc">{st_lbl}</span> '
+                f'<span style="font-size:0.82rem;color:#7ecbf7;font-weight:600">{rt}</span>')
+
+    p1_html = pump_inline(1, pump1)
+    p2_html = pump_inline(2, pump2)
+    p3_html = pump_inline(3, pump3)
+
+    # ---- Chemistry inline ----
+    temp_html = chem_inline_html("Temp", temp_val, "°F", TEMP_MIN_F, TEMP_MAX_F,
+                                 st.session_state.get("chem_min_temp"),
+                                 st.session_state.get("chem_max_temp"), fmt=".1f")
+    ph_html   = chem_inline_html("pH",   ph_val,   "",   PH_MIN,     PH_MAX,
+                                 st.session_state.get("chem_min_ph"),
+                                 st.session_state.get("chem_max_ph"),   fmt=".2f")
+    orp_html  = chem_inline_html("ORP",  orp_val,  " mV",ORP_MIN,    ORP_MAX,
+                                 st.session_state.get("chem_min_orp"),
+                                 st.session_state.get("chem_max_orp"),  fmt=".0f")
+
     spa_card_html = f"""
     <div class="spa-card">
+      {alert_banner}
       <div class="spa-title">🛁 Monisha's Tub — Live Status</div>
 
+      <!-- Header: temp + connection -->
       <div style="display:flex;align-items:flex-end;gap:24px;flex-wrap:wrap;">
         <div>
           <div class="spa-temp-big" style="color:{temp_color}">{temp if temp is not None else "—"} °F</div>
@@ -1223,50 +1188,60 @@ else:
 
       <hr class="spa-divider">
 
-      <div class="spa-section-label">Pumps</div>
-      {pump_badge(pump1, 1)} {pump_badge(pump2, 2)} {pump_badge(pump3, 3)}
+      <!-- Chemistry row -->
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;line-height:1.8">
+        {temp_html} &nbsp;·&nbsp; {ph_html} &nbsp;·&nbsp; {orp_html}
+      </div>
 
-      <div class="spa-section-label">Lights &amp; Filter</div>
+      <hr class="spa-divider">
+
+      <!-- Pumps + runtime -->
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;line-height:1.8">
+        {p1_html} &nbsp;·&nbsp; {p2_html} &nbsp;·&nbsp; {p3_html}
+      </div>
+      <div style="font-size:0.7rem;color:#3a5a70;margin-top:2px">runtime today · resets midnight</div>
+
+      <hr class="spa-divider">
+
+      <!-- Lights & filter -->
       <span class="spa-badge {lights_cls}">Lights: {lights or "?"}</span>
       <span class="spa-badge {filter_cls}">Filter: {filter_status or "?"}</span>
       {filtration_html}
-
-      <div class="spa-section-label">Water Chemistry</div>
-      {chem_badge(ph, ph_status)} &nbsp; {chem_badge(orp, orp_status)}
 
       {errors_html}
     </div>
     """
 
-    st.components.v1.html(
-        f"""
-        <style>
-        .spa-card {{ background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
-          border-radius: 14px; padding: 18px 20px; color: #fff; margin-bottom: 10px;
-          box-shadow: 0 4px 18px rgba(0,0,0,0.18); font-family: sans-serif; }}
-        .spa-title {{ font-size: 1.05rem; font-weight: 700; color: #7ecbf7; letter-spacing: 0.03em; margin-bottom: 12px; }}
-        .spa-temp-big {{ font-size: 2.6rem; font-weight: 800; line-height: 1; }}
-        .spa-temp-sub {{ font-size: 0.88rem; color: #a0c8e8; margin-top: 4px; }}
-        .spa-badge {{ display:inline-block; padding:4px 10px; border-radius:20px; font-size:0.8rem; font-weight:600; margin:3px 3px 3px 0; }}
-        .spa-badge-ok   {{ background:rgba(40,200,100,0.22);  color:#6effa8; border:1px solid rgba(40,200,100,0.4); }}
-        .spa-badge-warn {{ background:rgba(255,160,0,0.22);   color:#ffd060; border:1px solid rgba(255,160,0,0.4); }}
-        .spa-badge-err  {{ background:rgba(220,60,60,0.22);   color:#ff8080; border:1px solid rgba(220,60,60,0.4); }}
-        .spa-badge-off  {{ background:rgba(120,120,120,0.22); color:#ccc;    border:1px solid rgba(120,120,120,0.3); }}
-        .spa-section-label {{ font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em; color:#7ecbf7; margin-bottom:5px; margin-top:12px; font-weight:600; }}
-        .spa-divider {{ border:none; border-top:1px solid rgba(255,255,255,0.08); margin:10px 0; }}
-        .alert-banner {{ background:linear-gradient(90deg,#7b1a1a,#b02020); border-radius:8px; padding:10px 14px; color:#fff; font-weight:600; margin-bottom:10px; }}
-        </style>
-        {spa_card_html}
-        """,
-        height=420,
-        scrolling=False,
-    )
+    # Inline styles for the iframe
+    inline_styles = """
+    <style>
+    body { margin:0; font-family: sans-serif; }
+    .spa-card { background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
+      border-radius: 14px; padding: 18px 20px; color: #fff; margin-bottom: 10px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.18); }
+    .spa-title { font-size: 1.05rem; font-weight: 700; color: #7ecbf7;
+      letter-spacing: 0.03em; margin-bottom: 12px; }
+    .spa-temp-big { font-size: 2.6rem; font-weight: 800; line-height: 1; }
+    .spa-temp-sub { font-size: 0.88rem; color: #a0c8e8; margin-top: 4px; }
+    .spa-badge { display:inline-block; padding:4px 10px; border-radius:20px;
+      font-size:0.8rem; font-weight:600; margin:3px 3px 3px 0; }
+    .spa-badge-ok   { background:rgba(40,200,100,0.22);  color:#6effa8; border:1px solid rgba(40,200,100,0.4); }
+    .spa-badge-warn { background:rgba(255,160,0,0.22);   color:#ffd060; border:1px solid rgba(255,160,0,0.4); }
+    .spa-badge-err  { background:rgba(220,60,60,0.22);   color:#ff8080; border:1px solid rgba(220,60,60,0.4); }
+    .spa-badge-off  { background:rgba(120,120,120,0.22); color:#ccc;    border:1px solid rgba(120,120,120,0.3); }
+    .spa-section-label { font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em;
+      color:#7ecbf7; margin-bottom:5px; margin-top:12px; font-weight:600; }
+    .spa-divider { border:none; border-top:1px solid rgba(255,255,255,0.08); margin:10px 0; }
+    .alert-banner { background:linear-gradient(90deg,#7b1a1a,#b02020); border-radius:8px;
+      padding:10px 14px; color:#fff; font-weight:600; margin-bottom:10px; }
+    </style>
+    """
 
-    # raw toggle
+    st.components.v1.html(inline_styles + spa_card_html, height=360, scrolling=False)
+
     with st.expander("Raw spa payload (debug)"):
         st.json(spa)
 
-# close frame
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------- Enphase iframe ----------
@@ -1278,13 +1253,17 @@ except Exception:
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase hour graph (public)</a>', unsafe_allow_html=True)
 st.markdown(f'If embedding is blocked: <a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open in new tab</a>', unsafe_allow_html=True)
 
-# Footer
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-st.caption("Compact layout · Hourly starts at next full hour · First shown hour labeled 'Now' if within 60 min · Feels-like, POP & color-coded temps · Alerts via ntfy.sh")
+st.caption("Compact layout · Hourly starts at next full hour · First shown hour labeled 'Now' · Feels-like, POP & color-coded temps · Pump runtime tracked in-session · Chemistry range bars · Alerts via ntfy.sh")
 if st.checkbox("Show debug"):
     st.write("config:", config)
     st.write("zip:", zip_to_use)
     st.write("last_auto_refresh:", st.session_state.get("last_auto_refresh"))
     st.write("arcticspas installed:", ARCTICSPAS_INSTALLED)
     st.write("ntfy topic:", NTFY_TOPIC)
-    st.write("ntfy server:", NTFY_SERVER)
+    st.write("pump_runtime_date:", st.session_state.get("pump_runtime_date"))
+    for _n in [1, 2, 3]:
+        daily_s = st.session_state.get(f"pump_daily_seconds_{_n}", 0)
+        on_since = st.session_state.get(f"pump_on_since_{_n}")
+        live = (time.time() - on_since) if on_since else 0
+        st.write(f"pump_{_n}: daily={daily_s:.0f}s live={live:.0f}s state={st.session_state.get(f'pump_state_{_n}')}")
