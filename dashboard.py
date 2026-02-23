@@ -1009,12 +1009,14 @@ else:
     # Alerts trigger on: temp < 4F, spa disconnected, explicit error statuses, or spa-reported errors.
     # Pumps being "off" is NORMAL — they cycle. Unknown/None values are NOT alert conditions.
     def _is_error_status(val):
-        """Only returns True for explicit error/fault values. None, off, unknown = not an alert."""
+        """Only returns True for explicit error/fault/out-of-range values. None, off, unknown = not an alert."""
         if val is None:
             return False
         try:
             s = str(val).strip().lower()
-            return s in ("error", "critical", "fault", "failed", "failure", "alarm", "danger")
+            return s in ("error", "critical", "fault", "failed", "failure", "alarm", "danger",
+                         "high", "low", "too_high", "too_low", "toohigh", "toolow",
+                         "out_of_range", "outofrange", "warning")
         except Exception:
             return False
 
@@ -1025,6 +1027,10 @@ else:
     except Exception:
         temp_val = None
 
+    # Safe range constants — adjust here if needed
+    PH_MIN,  PH_MAX  = 7.2, 7.8      # ideal spa pH range
+    ORP_MIN, ORP_MAX = 600, 800       # ideal ORP range (mV)
+
     other_not_ok = False
     reasons: List[str] = []
 
@@ -1032,13 +1038,39 @@ else:
     if connected is False:
         other_not_ok = True; reasons.append("spa disconnected")
 
-    # Status fields — only alert on explicit error values, not off/unknown/None
+    # Status fields — alert on explicit error/high/low values from the API
     if _is_error_status(filter_status):
         other_not_ok = True; reasons.append(f"filter_status={filter_status}")
     if _is_error_status(ph_status):
         other_not_ok = True; reasons.append(f"ph_status={ph_status}")
     if _is_error_status(orp_status):
         other_not_ok = True; reasons.append(f"orp_status={orp_status}")
+
+    # Numeric pH range check (7.2 – 7.8)
+    ph_val = None
+    try:
+        if ph is not None:
+            ph_val = float(ph)
+    except Exception:
+        ph_val = None
+    if ph_val is not None:
+        if ph_val < PH_MIN:
+            other_not_ok = True; reasons.append(f"pH too low: {ph_val:.2f} (min {PH_MIN})")
+        elif ph_val > PH_MAX:
+            other_not_ok = True; reasons.append(f"pH too high: {ph_val:.2f} (max {PH_MAX})")
+
+    # Numeric ORP range check (600 – 800 mV)
+    orp_val = None
+    try:
+        if orp is not None:
+            orp_val = float(orp)
+    except Exception:
+        orp_val = None
+    if orp_val is not None:
+        if orp_val < ORP_MIN:
+            other_not_ok = True; reasons.append(f"ORP too low: {orp_val:.0f} mV (min {ORP_MIN})")
+        elif orp_val > ORP_MAX:
+            other_not_ok = True; reasons.append(f"ORP too high: {orp_val:.0f} mV (max {ORP_MAX})")
 
     # Explicit errors reported by the spa
     if errors:
