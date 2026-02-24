@@ -1,3 +1,12 @@
 {
-  "zip_code": "84124"
+  "zip_code": "84124",
+  "chem_ranges": {
+    "date": "2026-02-23",
+    "temp_min": 101.0,
+    "temp_max": 101.0,
+    "ph_min": 7.71,
+    "ph_max": 7.71,
+    "orp_min": 636.0,
+    "orp_max": 636.0
+  }
 }
