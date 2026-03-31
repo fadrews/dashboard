@@ -179,8 +179,8 @@ ARCTIC_BASE         = "https://api.myarcticspa.com"
 ARCTIC_SPA_PORTAL_HINT = "https://myarcticspa.com/spa/SpaAPIManagement.aspx"
 
 # Chemistry safe ranges
-PH_MIN,   PH_MAX   = 7.2, 7.8
-ORP_MIN,  ORP_MAX  = 600, 800
+PH_MIN,   PH_MAX   = 7.1, 7.9 #.2 .8
+ORP_MIN,  ORP_MAX  = 520, 700 #600 800
 TEMP_MIN_F, TEMP_MAX_F = 95.0, 104.0
 
 # ---------------- Utilities ----------------
@@ -977,7 +977,7 @@ else:
     alert_sent_recently = False
     if "last_spa_alert" in st.session_state:
         try:
-            if time.time() - float(st.session_state["last_spa_alert"]) < 3600:
+            if time.time() - float(st.session_state["last_spa_alert"]) < 14400: #was 3600 changed to 14400
                 alert_sent_recently = True
         except: pass
 
