@@ -432,7 +432,7 @@ def process_new_spa_observation(spa, checked_at, *, trigger_alert, reasons,
 
 
 # ============================================================
-# PERSISTENT CHEMISTRY RANGE â€” survives browser refresh
+# PERSISTENT CHEMISTRY RANGE — survives browser refresh
 # ============================================================
 # Stored in .user_config.json under key "chem_ranges":
 #   { "date": "YYYY-MM-DD",
@@ -653,9 +653,9 @@ def chem_inline_html(label, value, unit, safe_lo, safe_hi, day_min, day_max, fmt
     val_color = "#14753b" if in_range else "#b42318"
     val_str   = f"{value:{fmt}}"
     if day_min is not None and day_max is not None:
-        range_str = f"{day_min:{fmt}}â€“{day_max:{fmt}}"
+        range_str = f"{day_min:{fmt}}–{day_max:{fmt}}"
     else:
-        range_str = "â€”"
+        range_str = "—"
     return (f'<span style="font-size:0.82rem;color:#475569">{label}:</span> '
             f'<span style="font-weight:700;color:{val_color}">{val_str}{unit}</span> '
             f'<span style="font-size:0.74rem;color:#64748b">[{range_str}]</span>')
@@ -667,29 +667,77 @@ def chem_inline_html(label, value, unit, safe_lo, safe_hi, day_min, day_max, fmt
 st.set_page_config(layout="wide", page_title="Home Dashboard", initial_sidebar_state="collapsed")
 
 st.markdown("""<style>
-/* Streamlit 1.65 compatible, compact desktop and Family Hub layout */
+/* Compact, iframe-free sections for Streamlit 1.65 and the Samsung browser. */
 [data-testid="stAppViewContainer"] {background:#f7f9fc;}
-[data-testid="stMainBlockContainer"],section.main .block-container {max-width:100%;padding:2.35rem 1rem .6rem !important;}
+[data-testid="stMainBlockContainer"], section.main .block-container {max-width:100%; padding:2.35rem 1rem .65rem !important;}
 [data-testid="stVerticalBlock"] {gap:.35rem !important;}
 [data-testid="stHeader"] {height:2rem !important;background:#f7f9fc;}
-.section-heading {font:700 1.12rem/1.25 Arial,sans-serif;padding:9px 13px;margin:8px 0 2px;border:1px solid #c8dfed;border-radius:9px;color:#173f5c;background:#dceefa;}
+.section-heading {font:700 1.1rem/1.25 Arial,sans-serif;padding:8px 12px;
+  margin:6px 0 4px;border:1px solid #c8dfed;border-radius:8px;
+  color:#173f5c;background:#dceefa;}
 .section-heading.spa {background:#ffead5;border-color:#f1d6b8;color:#633b23;}
 .section-heading.solar {background:#e2f3df;border-color:#cce3c8;color:#24552b;}
-.section-note {background:white;border:1px solid #cce3c8;border-radius:8px;padding:10px 13px;font:14px Arial,sans-serif;color:#394b59;}
-.section-note a {color:#155b30;font-weight:700;}
-.weather-panel {background:white;border:1px solid #d7e5ef;border-radius:9px;padding:9px 10px 7px;}
+.weather-panel,.spa-panel,.solar-panel {box-sizing:border-box;background:#fff;border:1px solid #d7e5ef;
+  border-radius:8px;padding:10px 12px 0;clear:both;overflow:visible;}
+.spa-panel {border-color:#efd8bf;}
+.solar-panel {border-color:#cce3c8;}
+.panel-footer {box-sizing:border-box;position:static;clear:both;display:flex;align-items:center;
+  justify-content:flex-end;gap:6px;flex-wrap:wrap;border-top:1px solid #e4e9ee;
+  margin-top:9px;padding:7px 1px 8px;min-height:28px;
+  color:#536678;font:11px/1.35 Arial,sans-serif;overflow-wrap:anywhere;}
+.panel-footer .footer-label {font-weight:700;text-transform:uppercase;letter-spacing:.03em;color:#52657a;}
+.panel-footer .footer-alert {color:#a62319;}
 .weather-panel .forecast-title {font:700 13px Arial,sans-serif;color:#395b72;margin:0 0 5px;}
+.weather-two {display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:12px;}
+.weather-two>div {min-width:0;}
+.weather-two>div+div {border-left:1px solid #dbe4ed;padding-left:12px;}
 .weather-grid {display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;}
 .weather-grid.daily {grid-template-columns:repeat(5,minmax(0,1fr));}
 .weather-card {text-align:center;min-width:0;font:12px/1.18 Arial,sans-serif;color:#273747;}
 .weather-card .when {font-size:13px;font-weight:700;margin-bottom:3px;}
 .weather-card img {width:46px;height:46px;object-fit:contain;display:block;margin:0 auto;}
 .weather-card .temp {font-size:16px;font-weight:700;margin-top:2px;}
-.weather-card .sub {font-size:11px;color:#506275;margin-top:2px;}
-.weather-two {display:grid;grid-template-columns:1.2fr 1fr;gap:12px;}
-.weather-two >div+div {border-left:1px solid #dbe4ed;padding-left:12px;}
-@media(max-width:800px){.weather-two {grid-template-columns:1fr;gap:9px}.weather-two >div+div {border-left:0;border-top:1px solid #dbe4ed;padding:9px 0 0;}}
-@media(max-width:520px){.weather-card img{width:32px;height:32px}.weather-card .temp{font-size:13px}.weather-card .sub{font-size:9px}}
+.weather-card .sub {font-size:11px;color:#506275;margin-top:2px;overflow-wrap:anywhere;}
+/* Spa: fully native HTML, no fixed-height embedded iframe and no iframe scrollbar. */
+.spa-three {display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1fr) minmax(0,1.45fr);gap:0;}
+.spa-col {padding:3px 12px;min-width:0;overflow-wrap:anywhere;}
+.spa-col:first-child {padding-left:2px;}
+.spa-col+.spa-col {border-left:1px solid #dce2e8;}
+.spa-subhead {font:700 12px/1.3 Arial,sans-serif;color:#64748b;margin:0 0 8px;}
+.spa-temperature {font:800 32px/1.1 Arial,sans-serif;color:#273d4d;}
+.spa-temperature.bad {color:#b42318;}
+.spa-setpoint {font:14px/1.3 Arial,sans-serif;margin:5px 0 9px;}
+.spa-status {display:inline-block;padding:2px 7px;border-radius:12px;font:700 11px/1.3 Arial,sans-serif;white-space:nowrap;}
+.spa-status.ok {background:#def4e4;color:#146c38;}
+.spa-status.bad {background:#ffe0dc;color:#a62319;}
+.spa-status.neutral {background:#edf0f3;color:#53616d;}
+.spa-detail {font:12px/1.4 Arial,sans-serif;margin:5px 0;color:#263749;}
+.spa-pump-row {display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:5px;align-items:center;
+  font:13px/1.35 Arial,sans-serif;padding:3px 0;border-bottom:1px solid #edf0f3;}
+.spa-pump-row small {font-size:11px;color:#637383;}
+.spa-chem-row {display:grid;grid-template-columns:40px minmax(68px,1fr) 48px minmax(78px,1fr);
+  gap:5px;align-items:center;padding:5px 0;border-bottom:1px solid #edf0f3;font:13px/1.35 Arial,sans-serif;}
+.spa-chem-row small {font-size:10px;color:#637383;white-space:normal;}
+.spa-issues {background:#fff1ed;color:#a62319;padding:5px 7px;margin-top:7px;
+  border-radius:5px;font:12px/1.4 Arial,sans-serif;}
+.spa-no-issues {color:#217447;font:11px/1.4 Arial,sans-serif;margin-top:6px;}
+.solar-panel .solar-intro {font:14px/1.5 Arial,sans-serif;color:#394b59;padding:0 0 7px;}
+.solar-panel a {color:#155b30;font-weight:700;}
+@media(max-width:850px) {
+  .weather-two {grid-template-columns:1fr;gap:9px;}
+  .weather-two>div+div {border-left:0;border-top:1px solid #dbe4ed;padding:9px 0 0;}
+  .spa-three {grid-template-columns:1fr 1fr;}
+  .spa-col:last-child {grid-column:1/-1;border-left:0;border-top:1px solid #dce2e8;
+    padding-top:8px;margin-top:7px;}
+}
+@media(max-width:520px) {
+  .weather-card img {width:32px;height:32px;}
+  .weather-card .temp {font-size:13px;}
+  .weather-card .sub {font-size:9px;}
+  .spa-pump-row {grid-template-columns:24px minmax(0,1fr);}
+  .spa-pump-row small {grid-column:2;}
+  .spa-chem-row {grid-template-columns:34px minmax(58px,1fr) 43px minmax(58px,1fr);}
+}
 </style>""", unsafe_allow_html=True)
 
 
@@ -710,8 +758,8 @@ for _k in ("temp", "ph", "orp"):
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
-    st.title("âš™ï¸ Settings")
-    st.subheader("ðŸ“ Location")
+    st.title("Settings")
+    st.subheader("Location")
     saved_zip = config.get("zip_code", DEFAULT_ZIP)
     zip_input = st.text_input("ZIP code (US)", value=saved_zip)
     if st.button("Save ZIP"):
@@ -727,9 +775,9 @@ with st.sidebar:
         else:
             st.info("Enter a ZIP first.")
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("ðŸŒ¡ï¸ Display")
-    unit_choice = st.radio("Temp unit", ["Â°F", "Â°C"], index=0)
-    use_celsius = unit_choice == "Â°C"
+    st.subheader("Display")
+    unit_choice = st.radio("Temp unit", ["Fahrenheit (F)", "Celsius (C)"], index=0)
+    use_celsius = unit_choice == "Celsius (C)"
     st.caption("Weather updates while this browser session is active; spa checks no more than hourly.")
     if st.button("Refresh display now"):
         safe_rerun()
@@ -759,23 +807,23 @@ with st.sidebar:
             st.session_state[f"chem_max_{_k}"] = None
         st.success("Chemistry ranges reset."); safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("â˜€ï¸ Enphase")
+    st.subheader("Enphase")
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase (public)</a>', unsafe_allow_html=True)
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("ðŸ“² Push Alerts")
+    st.subheader("Push Alerts")
     st.markdown('<span class="signal-badge">via ntfy.sh</span>', unsafe_allow_html=True)
     if NTFY_TOPIC:
-        st.caption(f"âœ… Topic: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
+        st.caption(f"Topic: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
     else:
-        st.warning("NTFY_TOPIC not set â€” using default.")
-    if st.button("ðŸ“¨ Send test push notification"):
+        st.warning("NTFY_TOPIC not set - using default.")
+    if st.button("Send test push notification"):
         try:
-            send_ntfy_message(NTFY_TOPIC, "Test Alert", "âœ… Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
+            send_ntfy_message(NTFY_TOPIC, "Test Alert", "✅ Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
             st.success(f"Test notification sent to: `{NTFY_TOPIC}`")
         except Exception as exc:
             st.error(f"Failed: {exc}")
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("ðŸ› Arctic Spa")
+    st.subheader("Arctic Spa")
     st.markdown(f'<a href="{ARCTIC_BASE}" target="_blank" rel="noopener noreferrer">Open Arctic Spa portal</a>', unsafe_allow_html=True)
     with st.expander("Local login form (manual only)"):
         st.info("This form is a local convenience only.")
@@ -795,7 +843,7 @@ with st.sidebar:
         st.warning("No Arctic Spa token found in st.secrets.")
     if st.button("Show latest stored spa status"):
         result = _spa_result_from_ops(_read_ops())
-        if result["ok"]: st.success(f"Status OK â€” HTTP {result['status_code']}"); st.json(result["data"])
+        if result["ok"]: st.success(f"Status OK - HTTP {result['status_code']}"); st.json(result["data"])
         else:             st.error(f"Failed: {result['error']}")
 
 # ---------------- Layout ----------------
@@ -857,12 +905,23 @@ def compute_feels_like_for_period(period, to_celsius_flag):
 
 
 
+# Shared HTML footers. All visible checked times are inside their panels.
+# Use ASCII-only markup plus HTML numeric references for old Samsung/Tizen HTML parsers.
+def _html_text(value):
+    from html import escape
+    return escape(str(value), quote=True).encode("ascii", "xmlcharrefreplace").decode("ascii")
+
+def _checked_footer(timestamp, *, note=None):
+    value = _html_text(_local_timestamp(timestamp)) if timestamp else "Not available"
+    note_html = (f'<span class="footer-alert">{_html_text(note)}</span>' if note else "")
+    return (f'<div class="panel-footer">{note_html}'
+            f'<span class="footer-label">Last checked:</span><span>{value}</span></div>')
+
 # Browser-active auto-refresh changes only the weather section, not spa API activity.
 @st.fragment(run_every="5m")
 def render_weather_section():
     # ---------- Unified weather panel (native Streamlit HTML, no iframe) ----------
     from html import escape as _html_escape
-    st.markdown('<div class="section-heading">Weather Forecast - ZIP {}</div>'.format(_html_escape(str(zip_to_use))), unsafe_allow_html=True)
     weather_obj = None
     if lat is not None and lon is not None:
         try:
@@ -907,14 +966,20 @@ def render_weather_section():
             if not common: common = next((p.get("shortForecast") for p in group if p.get("shortForecast")), "")
             unit = "C" if use_celsius else "F"
             daily_cards.append('<div class="weather-card"><div class="when">{}</div>{}<div class="temp">{}&deg; / {}&deg;{}</div><div class="sub">{}</div></div>'.format(day.strftime("%a"),icon,high,low,unit,_html_escape(common[:32])))
-        weather_html = ('<div class="weather-panel"><div class="weather-two">'
+        weather_html = (
+            '<div class="section-heading">Weather Forecast - ZIP {}</div>'
+            '<div class="weather-panel"><div class="weather-two">'
             '<div><div class="forecast-title">Next 6 hours</div><div class="weather-grid">{}</div></div>'
             '<div><div class="forecast-title">5-day outlook</div><div class="weather-grid daily">{}</div></div>'
-            '</div></div>').format("".join(hourly_cards),"".join(daily_cards))
+            '</div>{}</div>'
+        ).format(_html_text(zip_to_use), "".join(hourly_cards), "".join(daily_cards),
+                 _checked_footer(weather_obj.get("fetched_at")))
         st.markdown(weather_html, unsafe_allow_html=True)
-        st.caption("NWS forecast checked " + _local_timestamp(weather_obj.get("fetched_at")))
     else:
-        st.info("No forecast available.")
+        weather_html = ('<div class="section-heading">Weather Forecast - ZIP {}</div>'
+                        '<div class="weather-panel"><div class="spa-detail">No forecast available.</div>{}</div>')
+        st.markdown(weather_html.format(_html_text(zip_to_use), _checked_footer(None)),
+                    unsafe_allow_html=True)
 
 
 render_weather_section()
@@ -922,21 +987,21 @@ render_weather_section()
 # ============================================================
 # Arctic Spa Status Card
 # ============================================================
-st.markdown('<div class="section-heading spa">Monisha\'s Bath Tub</div>', unsafe_allow_html=True)
 spa_result = get_spa_status_throttled()
 _sync_pump_session(USER_TZ)
 _sync_chem_session(USER_TZ)
-if spa_result.get("checked_at"):
-    detail = "Spa last checked " + _local_timestamp(spa_result["checked_at"])
-    if spa_result.get("stale"):
-        detail += " - cached reading; latest API check failed"
-    st.caption(detail)
-
-
+spa_footer = _checked_footer(
+    spa_result.get("checked_at"),
+    note="Cached reading; latest spa check failed" if spa_result.get("stale") else None,
+)
 
 
 if not spa_result.get("ok"):
-    st.info("ðŸ› Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
+    unavailable = _html_text(spa_result.get("error") or "no token / failed request")
+    st.markdown(
+        '<div class="section-heading spa">Monisha&#39;s Bath Tub</div>'
+        f'<div class="spa-panel"><div class="spa-detail">Spa status unavailable: {unavailable}</div>'
+        f'{spa_footer}</div>', unsafe_allow_html=True)
 else:
     try:
         spa_test  # noqa: F821
@@ -1031,17 +1096,13 @@ else:
         ph_val=ph_val, orp_val=orp_val, connected=connected,
         filter_status=filter_status, ph_status=ph_status,
         orp_status=orp_status, errors=errors)
-    if effects.get("notification") == "failed":
-        st.warning("Spa alert notification failed; see operational events in Settings.")
-    if effects.get("setpoint") and not effects["setpoint"].get("ok"):
-        st.warning("Automatic setpoint reapplication failed; see operational events.")
     _sync_pump_session(USER_TZ)
     _sync_chem_session(USER_TZ)
 
     # ---- Build spa card HTML ----
     if trigger_alert:
-        problems_str = " Â· ".join(reasons) if reasons else "temp below setpoint"
-        alert_banner = f'<div class="alert-banner">âš ï¸ Alert condition detected â€” {problems_str}</div>'
+        problems_str = " · ".join(reasons) if reasons else "temp below setpoint"
+        alert_banner = f'<div class="alert-banner">⚠️ Alert condition detected — {problems_str}</div>'
     else:
         alert_banner = ""
 
@@ -1068,7 +1129,7 @@ else:
     if spaboy_connected is not None:
         sb_cls   = "spa-badge-ok" if spaboy_connected else "spa-badge-off"
         sp_label = "SpaBoy " + ("connected" if spaboy_connected else "disconnected")
-        if spaboy_producing: sp_label += " Â· producing"
+        if spaboy_producing: sp_label += " · producing"
         spaboy_html = f'<span class="spa-badge {sb_cls}">{sp_label}</span>'
 
     lights_cls = badge_class(lights)
@@ -1076,10 +1137,10 @@ else:
 
     errors_html = ""
     if errors:
-        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">âš  {e}</div>' for e in errors)
+        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">⚠ {e}</div>' for e in errors)
         errors_html = f'<hr class="spa-divider"><div class="spa-section-label">Errors / Alerts</div>{err_items}'
     else:
-        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">âœ… No active errors</div>'
+        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">✅ No active errors</div>'
 
     filtration_html = ""
     if filtration_frequency or filtration_duration:
@@ -1088,7 +1149,7 @@ else:
     def pump_inline(n, pval):
         rt    = get_pump_runtime_display(n)
         is_on = _is_pump_on(pval)
-        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"â—" if is_on else "â—‹"}</span>'
+        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"●" if is_on else "○"}</span>'
         st_lbl = str(pval or "off")
         return (f'<span style="color:#a0c8e8;font-size:0.82rem">P{n}</span> {dot} '
                 f'<span style="font-size:0.82rem;color:#ccc">{st_lbl}</span> '
@@ -1098,7 +1159,7 @@ else:
     p2_html = pump_inline(2, pump2)
     p3_html = pump_inline(3, pump3)
 
-    temp_html = chem_inline_html("Temp", temp_val, "Â°F", TEMP_MIN_F, TEMP_MAX_F,
+    temp_html = chem_inline_html("Temp", temp_val, "°F", TEMP_MIN_F, TEMP_MAX_F,
                                  st.session_state.get("chem_min_temp"),
                                  st.session_state.get("chem_max_temp"), fmt=".1f")
     ph_html   = chem_inline_html("pH", ph_val, "", PH_MIN, PH_MAX,
@@ -1108,26 +1169,27 @@ else:
                                  st.session_state.get("chem_min_orp"),
                                  st.session_state.get("chem_max_orp"), fmt=".0f")
 
-    # Three-column light panel. All spa measurements remain on the main page.
-    # Use the existing HTML component on Streamlit 1.65 for older Tizen compatibility.
+    # Native Streamlit HTML (no iframe) eliminates fixed-height clipping and
+    # lets the status timestamp occupy the same bottom row as Weather.
+    # Sanitize all provider strings before inserting them into HTML.
     def _display(value, suffix=""):
-        return f"{value}{suffix}" if value is not None else "â€”"
+        return _html_text(value) + suffix if value is not None else "&mdash;"
 
     def _chem_row(label, value, lo, hi, unit, minimum, maximum, fmt):
         if value is None:
-            status, shown = "Unavailable", "â€”"
-            status_cls = "neutral"
+            shown, status, status_cls = "&mdash;", "Unavailable", "neutral"
         else:
             status_cls = "ok" if lo <= value <= hi else "bad"
             status = "OK" if status_cls == "ok" else "Check"
             shown = f"{value:{fmt}}{unit}"
-        day = (f"{minimum:{fmt}}â€“{maximum:{fmt}}" if minimum is not None and maximum is not None else "â€”")
-        return (f'<div class="chem-row"><span>{label}</span><strong>{shown}</strong>'
-                f'<span class="status {status_cls}">{status}</span>'
+        day = (f"{minimum:{fmt}}&ndash;{maximum:{fmt}}"
+               if minimum is not None and maximum is not None else "&mdash;")
+        return (f'<div class="spa-chem-row"><span>{label}</span><strong>{shown}</strong>'
+                f'<span class="spa-status {status_cls}">{status}</span>'
                 f'<small>Today {day}</small></div>')
 
     chem_rows = "".join([
-        _chem_row("Temp", temp_val, TEMP_MIN_F, TEMP_MAX_F, "Â°F",
+        _chem_row("Temp", temp_val, TEMP_MIN_F, TEMP_MAX_F, "&deg;F",
                   st.session_state.get("chem_min_temp"), st.session_state.get("chem_max_temp"), ".1f"),
         _chem_row("pH", ph_val, PH_MIN, PH_MAX, "",
                   st.session_state.get("chem_min_ph"), st.session_state.get("chem_max_ph"), ".2f"),
@@ -1137,59 +1199,54 @@ else:
     conn_status = "Connected" if connected else "Disconnected" if connected is False else "Unknown"
     conn_class = "ok" if connected else "bad" if connected is False else "neutral"
     temp_class = "bad" if temp_below_setpoint else "ok" if temp_val is not None else "neutral"
-    spa_boy_status = ("Producing" if spaboy_producing else "Connected" if spaboy_connected else "Disconnected") if spaboy_connected is not None else "Unknown"
+    spa_boy_status = (
+        "Producing" if spaboy_producing else "Connected" if spaboy_connected else "Disconnected"
+    ) if spaboy_connected is not None else "Unknown"
     pumps_html = "".join(
-        f'<div class="pump-row"><strong>P{n}</strong><span>{_display(v)}</span><small>{get_pump_runtime_display(n)} today (est.)</small></div>'
+        f'<div class="spa-pump-row"><strong>P{n}</strong>'
+        f'<span>{_display(v)}</span>'
+        f'<small>{_html_text(get_pump_runtime_display(n))} today (est.)</small></div>'
         for n, v in ((1, pump1), (2, pump2), (3, pump3))
     )
-    filtration_detail = (f" Â· {filtration_frequency or '?'}Ã—/day Â· {filtration_duration or '?'} min"
-                         if filtration_frequency or filtration_duration else "")
-    issue_html = (f'<div class="issues">âš  {problems_str}</div>' if trigger_alert else
-                  '<div class="no-issues">No active alerts</div>')
+    filtration_detail = (
+        f" &middot; {_display(filtration_frequency)}/day &middot; {_display(filtration_duration)} min"
+        if filtration_frequency or filtration_duration else ""
+    )
+    issue_html = (
+        '<div class="spa-issues">Alert: ' + _html_text("; ".join(reasons) if reasons else "temperature below setpoint") + '</div>'
+        if trigger_alert else '<div class="spa-no-issues">No active alerts</div>'
+    )
     if errors:
-        issue_html += '<div class="issues">' + ' Â· '.join(str(e) for e in errors) + '</div>'
+        issue_html += '<div class="spa-issues">' + _html_text("; ".join(str(e) for e in errors)) + '</div>'
+    if effects.get("notification") == "failed":
+        issue_html += '<div class="spa-issues">Notification failed. See Operations in Settings.</div>'
+    if effects.get("setpoint") and not effects["setpoint"].get("ok"):
+        issue_html += '<div class="spa-issues">Setpoint update failed. See Operations in Settings.</div>'
 
-    spa_card_html = f"""
-    <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-    <style>
-    *{{box-sizing:border-box}} body{{margin:0;font-family:Arial,sans-serif;color:#243447;background:#fff}}
-    .spa-card{{border:1px solid #efd8bf;border-radius:9px;padding:10px 12px;background:#fff;}}
-    .three{{display:grid;grid-template-columns:1.05fr 1fr 1.45fr;gap:0;}}
-    .col{{padding:3px 12px;min-width:0;}}
-    .col:first-child{{padding-left:2px}} .col+.col{{border-left:1px solid #dce2e8}}
-    .subhead{{font-size:12px;font-weight:700;color:#64748b;margin:0 0 8px}}
-    .temperature{{font-size:32px;font-weight:800;color:#273d4d;line-height:1.1}}
-    .temperature.bad{{color:#b42318}} .setpoint{{font-size:14px;margin:5px 0 9px}}
-    .status{{display:inline-block;padding:2px 7px;border-radius:12px;font-size:11px;font-weight:700;white-space:nowrap}}
-    .status.ok{{background:#def4e4;color:#146c38}} .status.bad{{background:#ffe0dc;color:#a62319}}
-    .status.neutral{{background:#edf0f3;color:#53616d}}
-    .detail{{font-size:12px;margin:5px 0;line-height:1.35}}
-    .pump-row{{display:grid;grid-template-columns:30px 1fr auto;gap:5px;align-items:center;font-size:13px;
-      padding:3px 0;border-bottom:1px solid #edf0f3}}
-    .pump-row small{{font-size:11px;color:#637383}}
-    .chem-row{{display:grid;grid-template-columns:40px minmax(68px,1fr) 48px minmax(78px,1fr);
-      gap:5px;align-items:center;padding:5px 0;border-bottom:1px solid #edf0f3;font-size:13px}}
-    .chem-row small{{font-size:10px;color:#637383;white-space:nowrap}}
-    .issues{{background:#fff1ed;color:#a62319;padding:5px 7px;margin-top:7px;border-radius:5px;font-size:12px}}
-    .no-issues{{color:#217447;font-size:11px;margin-top:6px}}
-    @media(max-width:650px){{.three{{grid-template-columns:1fr 1fr}} .col:last-child{{grid-column:1/-1;
-      border-left:0;border-top:1px solid #dce2e8;padding-top:8px;margin-top:7px}}}}
-    </style></head><body><div class="spa-card"><div class="three">
-      <div class="col"><div class="subhead">WATER TEMPERATURE</div>
-        <div class="temperature {temp_class}">{_display(temp, ' Â°F')}</div>
-        <div class="setpoint">Setpoint: <strong>{_display(setpoint, ' Â°F')}</strong></div>
-        <div class="detail">Connection: <span class="status {conn_class}">{conn_status}</span></div>
-        <div class="detail">SpaBoy: {spa_boy_status}</div></div>
-      <div class="col"><div class="subhead">PUMPS &amp; EQUIPMENT</div>
-        {pumps_html}
-        <div class="detail">Lights: <strong>{_display(lights)}</strong></div>
-        <div class="detail">Filter: <strong>{_display(filter_status)}</strong>{filtration_detail}</div></div>
-      <div class="col"><div class="subhead">WATER CHEMISTRY Â· DAILY MINâ€“MAX</div>
-        {chem_rows}
-        <div class="detail" style="font-size:10px;color:#64748b">Safe pH {PH_MIN}â€“{PH_MAX} Â· ORP {ORP_MIN}â€“{ORP_MAX} mV</div></div>
-    </div>{issue_html}</div></body></html>
-    """
-    st.components.v1.html(spa_card_html.encode("ascii", "xmlcharrefreplace").decode("ascii"), height=205 if not trigger_alert else 275, scrolling=False)
+    spa_panel_html = (
+        '<div class="section-heading spa">Monisha&#39;s Bath Tub</div>'
+        '<div class="spa-panel">'
+          '<div class="spa-three">'
+            '<div class="spa-col"><div class="spa-subhead">WATER TEMPERATURE</div>'
+              f'<div class="spa-temperature {temp_class}">{_display(temp, " &deg;F")}</div>'
+              f'<div class="spa-setpoint">Setpoint: <strong>{_display(setpoint, " &deg;F")}</strong></div>'
+              f'<div class="spa-detail">Connection: <span class="spa-status {conn_class}">{conn_status}</span></div>'
+              f'<div class="spa-detail">SpaBoy: {_html_text(spa_boy_status)}</div></div>'
+            '<div class="spa-col"><div class="spa-subhead">PUMPS &amp; EQUIPMENT</div>'
+              f'{pumps_html}'
+              f'<div class="spa-detail">Lights: <strong>{_display(lights)}</strong></div>'
+              f'<div class="spa-detail">Filter: <strong>{_display(filter_status)}</strong>{filtration_detail}</div></div>'
+            '<div class="spa-col"><div class="spa-subhead">WATER CHEMISTRY / DAILY MIN-MAX</div>'
+              f'{chem_rows}'
+              f'<div class="spa-detail" style="font-size:10px;color:#64748b">'
+              f'Safe pH {PH_MIN}&ndash;{PH_MAX} &middot; ORP {ORP_MIN}&ndash;{ORP_MAX} mV'
+              '</div></div>'
+          '</div>'
+          f'{issue_html}'
+          f'{spa_footer}'
+        '</div>'
+    )
+    st.markdown(spa_panel_html, unsafe_allow_html=True)
 
     with st.sidebar.expander("Raw spa payload (debug)"):
         st.json(spa)
@@ -1197,12 +1254,18 @@ else:
 
 
 
-# ---------- Solar: link only. No unsupported real-time solar measurements. ----------
-st.markdown('<div class="section-heading solar">Solar System (Enphase)</div>', unsafe_allow_html=True)
+# ---------- Solar: link only, no fabricated production data or background fetch. ----------
 st.markdown(
-    f'<div class="section-note">Solar production and system status are available on the Enphase website. '
+    '<div class="section-heading solar">Solar System (Enphase)</div>'
+    '<div class="solar-panel">'
+    '<div class="solar-intro">'
+    'Solar production and system status are available directly from Enphase. '
     f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">'
-    f'Open Solar System (new tab)</a></div>', unsafe_allow_html=True)
+    'Open Solar System (new tab)</a>'
+    '</div>'
+    '<div class="panel-footer"><span>External Enphase page; no solar data is polled here.</span></div>'
+    '</div>', unsafe_allow_html=True,
+)
 
 with st.sidebar.expander("Operations - last 30 events"):
     st.caption("Server-local diagnostic history; may reset after deployment/restart.")
