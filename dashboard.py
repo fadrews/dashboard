@@ -432,7 +432,7 @@ def process_new_spa_observation(spa, checked_at, *, trigger_alert, reasons,
 
 
 # ============================================================
-# PERSISTENT CHEMISTRY RANGE — survives browser refresh
+# PERSISTENT CHEMISTRY RANGE â€” survives browser refresh
 # ============================================================
 # Stored in .user_config.json under key "chem_ranges":
 #   { "date": "YYYY-MM-DD",
@@ -482,6 +482,59 @@ def _sync_chem_session(user_tz):
     for key in ("temp", "ph", "orp"):
         st.session_state[f"chem_min_{key}"] = ranges.get(f"{key}_min")
         st.session_state[f"chem_max_{key}"] = ranges.get(f"{key}_max")
+
+
+def ensure_chem_ranges_from_cached_sample(spa_result, user_tz):
+    """Repair absent daily min/max from a successful *today* spa observation.
+
+    The last successful sample and the daily ranges live in separate files.
+    Losing/resetting only the range file must not display missing min/max
+    while a same-day measurement is available. This is display-state repair:
+    it never calls the spa API, sends alerts, or modifies pump run times.
+    """
+    if not spa_result.get("ok") or not isinstance(spa_result.get("data"), dict):
+        return
+    checked_at = spa_result.get("checked_at")
+    if checked_at is None:
+        return
+    try:
+        sampled_day = datetime.fromtimestamp(float(checked_at), user_tz).date()
+        if sampled_day != datetime.now(user_tz).date():
+            return  # Yesterday's cached sample is not today's first reading.
+    except (ValueError, TypeError, OverflowError, OSError):
+        return
+
+    sample = spa_result["data"]
+    raw_temp = next((sample[key] for key in ("temperatureF", "temperature", "temp")
+                     if sample.get(key) is not None), None)
+    observations = {"temp": raw_temp, "ph": sample.get("ph"), "orp": sample.get("orp")}
+    with _ops_lock():
+        # Always start with the latest persisted record, including changes
+        # made by another browser session rather than its stale in-memory copy.
+        config.clear()
+        config.update(load_config())
+        ranges = _load_chem_ranges(user_tz)
+        initialized = []
+        for name, raw in observations.items():
+            try:
+                value = float(raw)
+                if not math.isfinite(value):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            lo_key, hi_key = f"{name}_min", f"{name}_max"
+            lo, hi = ranges.get(lo_key), ranges.get(hi_key)
+            if lo is not None and hi is not None:
+                continue  # Never replace an existing daily range.
+            if lo is None:
+                ranges[lo_key] = min(float(hi), value) if hi is not None else value
+            if hi is None:
+                ranges[hi_key] = max(float(lo), value) if lo is not None else value
+            initialized.append(name)
+        if initialized:
+            _save_chem_ranges(ranges)
+            _event("CHEM_RANGE_INITIALIZED", sampled_at=checked_at,
+                   fields=initialized, source="cached_current_day_spa_observation")
 
 
 def parse_iso_to_dt(iso_ts):
@@ -653,9 +706,9 @@ def chem_inline_html(label, value, unit, safe_lo, safe_hi, day_min, day_max, fmt
     val_color = "#14753b" if in_range else "#b42318"
     val_str   = f"{value:{fmt}}"
     if day_min is not None and day_max is not None:
-        range_str = f"{day_min:{fmt}}–{day_max:{fmt}}"
+        range_str = f"{day_min:{fmt}}â€“{day_max:{fmt}}"
     else:
-        range_str = "—"
+        range_str = "â€”"
     return (f'<span style="font-size:0.82rem;color:#475569">{label}:</span> '
             f'<span style="font-weight:700;color:{val_color}">{val_str}{unit}</span> '
             f'<span style="font-size:0.74rem;color:#64748b">[{range_str}]</span>')
@@ -818,7 +871,7 @@ with st.sidebar:
         st.warning("NTFY_TOPIC not set - using default.")
     if st.button("Send test push notification"):
         try:
-            send_ntfy_message(NTFY_TOPIC, "Test Alert", "✅ Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
+            send_ntfy_message(NTFY_TOPIC, "Test Alert", "âœ… Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
             st.success(f"Test notification sent to: `{NTFY_TOPIC}`")
         except Exception as exc:
             st.error(f"Failed: {exc}")
@@ -988,6 +1041,9 @@ render_weather_section()
 # Arctic Spa Status Card
 # ============================================================
 spa_result = get_spa_status_throttled()
+# Initialize or repair missing daily ranges using today's cached spa reading.
+# No new API request is made and the hourly polling gate is unaffected.
+ensure_chem_ranges_from_cached_sample(spa_result, USER_TZ)
 _sync_pump_session(USER_TZ)
 _sync_chem_session(USER_TZ)
 spa_footer = _checked_footer(
@@ -1101,8 +1157,8 @@ else:
 
     # ---- Build spa card HTML ----
     if trigger_alert:
-        problems_str = " · ".join(reasons) if reasons else "temp below setpoint"
-        alert_banner = f'<div class="alert-banner">⚠️ Alert condition detected — {problems_str}</div>'
+        problems_str = " Â· ".join(reasons) if reasons else "temp below setpoint"
+        alert_banner = f'<div class="alert-banner">âš ï¸ Alert condition detected â€” {problems_str}</div>'
     else:
         alert_banner = ""
 
@@ -1129,7 +1185,7 @@ else:
     if spaboy_connected is not None:
         sb_cls   = "spa-badge-ok" if spaboy_connected else "spa-badge-off"
         sp_label = "SpaBoy " + ("connected" if spaboy_connected else "disconnected")
-        if spaboy_producing: sp_label += " · producing"
+        if spaboy_producing: sp_label += " Â· producing"
         spaboy_html = f'<span class="spa-badge {sb_cls}">{sp_label}</span>'
 
     lights_cls = badge_class(lights)
@@ -1137,10 +1193,10 @@ else:
 
     errors_html = ""
     if errors:
-        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">⚠ {e}</div>' for e in errors)
+        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">âš  {e}</div>' for e in errors)
         errors_html = f'<hr class="spa-divider"><div class="spa-section-label">Errors / Alerts</div>{err_items}'
     else:
-        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">✅ No active errors</div>'
+        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">âœ… No active errors</div>'
 
     filtration_html = ""
     if filtration_frequency or filtration_duration:
@@ -1149,7 +1205,7 @@ else:
     def pump_inline(n, pval):
         rt    = get_pump_runtime_display(n)
         is_on = _is_pump_on(pval)
-        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"●" if is_on else "○"}</span>'
+        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"â—" if is_on else "â—‹"}</span>'
         st_lbl = str(pval or "off")
         return (f'<span style="color:#a0c8e8;font-size:0.82rem">P{n}</span> {dot} '
                 f'<span style="font-size:0.82rem;color:#ccc">{st_lbl}</span> '
@@ -1159,7 +1215,7 @@ else:
     p2_html = pump_inline(2, pump2)
     p3_html = pump_inline(3, pump3)
 
-    temp_html = chem_inline_html("Temp", temp_val, "°F", TEMP_MIN_F, TEMP_MAX_F,
+    temp_html = chem_inline_html("Temp", temp_val, "Â°F", TEMP_MIN_F, TEMP_MAX_F,
                                  st.session_state.get("chem_min_temp"),
                                  st.session_state.get("chem_max_temp"), fmt=".1f")
     ph_html   = chem_inline_html("pH", ph_val, "", PH_MIN, PH_MAX,
