@@ -1,7 +1,7 @@
 # dashboard.py
 """
 Streamlit app (dense mode) with improved hourly forecast behavior and Arctic Spas API integration.
-Compact version
+Updated design
 """
 
 from typing import Optional, Tuple, Dict, Any, List, Sequence
@@ -253,7 +253,7 @@ def clear_config():
 config = load_config()
 
 # ============================================================
-# PERSISTENT CHEMISTRY RANGE — survives browser refresh
+# PERSISTENT CHEMISTRY RANGE â€” survives browser refresh
 # ============================================================
 # Stored in .user_config.json under key "chem_ranges":
 #   { "date": "YYYY-MM-DD",
@@ -379,7 +379,7 @@ def get_nws_forecast_cached(lat, lon):
 
 
 # ============================================================
-# PUMP RUNTIME TRACKING — persisted to disk
+# PUMP RUNTIME TRACKING â€” persisted to disk
 # ============================================================
 # Stored in .user_config.json under key "pump_runtimes":
 #   {
@@ -395,10 +395,10 @@ def get_nws_forecast_cached(lat, lon):
 # time without losing anything between refreshes.
 #
 # State machine per pump (new_on vs prev_on from persisted last_state):
-#   off→on  : record on_since = now
-#   on→on   : daily_seconds += (now - on_since), reset on_since = now
-#   on→off  : daily_seconds += (now - on_since), clear on_since
-#   off→off : nothing
+#   offâ†’on  : record on_since = now
+#   onâ†’on   : daily_seconds += (now - on_since), reset on_since = now
+#   onâ†’off  : daily_seconds += (now - on_since), clear on_since
+#   offâ†’off : nothing
 # ============================================================
 
 def _is_pump_on(val):
@@ -415,7 +415,7 @@ def _load_pump_runtimes(user_tz) -> Dict[str, Any]:
     today  = _today_str(user_tz)
     stored = config.get("pump_runtimes", {})
     if not isinstance(stored, dict) or stored.get("date") != today:
-        # New day — start fresh but keep the structure
+        # New day â€” start fresh but keep the structure
         return {"date": today,
                 "1": {"daily_seconds": 0.0, "on_since": None, "last_state": None},
                 "2": {"daily_seconds": 0.0, "on_since": None, "last_state": None},
@@ -449,7 +449,7 @@ def update_pump_runtimes(pump_vals: Dict[int, Any], user_tz) -> None:
         daily    = float(entry.get("daily_seconds", 0.0))
 
         if new_on and prev_on:
-            # Was on, still on — accumulate time since last checkpoint
+            # Was on, still on â€” accumulate time since last checkpoint
             if on_since is not None:
                 daily += now_ts - on_since
             entry["daily_seconds"] = daily
@@ -459,21 +459,21 @@ def update_pump_runtimes(pump_vals: Dict[int, Any], user_tz) -> None:
         elif new_on and not prev_on:
             # Just turned on (or first load after refresh while pump is on)
             # If on_since is already set from a previous session, honour it
-            # (pump was already running before refresh — don't double-count)
+            # (pump was already running before refresh â€” don't double-count)
             if on_since is None:
                 entry["on_since"] = now_ts
                 changed = True
             # else: on_since already persisted, no change needed
 
         elif not new_on and prev_on:
-            # Just turned off — finalise
+            # Just turned off â€” finalise
             if on_since is not None:
                 daily += now_ts - on_since
             entry["daily_seconds"] = daily
             entry["on_since"]      = None
             changed = True
 
-        # off→off: nothing to update
+        # offâ†’off: nothing to update
 
         entry["last_state"] = str(new_val) if new_val is not None else None
 
@@ -499,23 +499,23 @@ def get_pump_runtime_display(n: int) -> str:
 
 def chem_inline_html(label, value, unit, safe_lo, safe_hi, day_min, day_max, fmt=".1f"):
     if value is None:
-        return f'<span style="color:#6a8eaa;font-size:0.82rem">{label}: N/A</span>'
+        return f'<span style="color:#64748b;font-size:0.82rem">{label}: N/A</span>'
     in_range  = safe_lo <= value <= safe_hi
-    val_color = "#6effa8" if in_range else "#ff6060"
+    val_color = "#14753b" if in_range else "#b42318"
     val_str   = f"{value:{fmt}}"
     if day_min is not None and day_max is not None:
-        range_str = f"{day_min:{fmt}}–{day_max:{fmt}}"
+        range_str = f"{day_min:{fmt}}â€“{day_max:{fmt}}"
     else:
-        range_str = "—"
-    return (f'<span style="font-size:0.82rem;color:#a0c8e8">{label}:</span> '
+        range_str = "â€”"
+    return (f'<span style="font-size:0.82rem;color:#475569">{label}:</span> '
             f'<span style="font-weight:700;color:{val_color}">{val_str}{unit}</span> '
-            f'<span style="font-size:0.74rem;color:#4a6a80">[{range_str}]</span>')
+            f'<span style="font-size:0.74rem;color:#64748b">[{range_str}]</span>')
 
 
 # ============================================================
 # App start
 # ============================================================
-st.set_page_config(layout="wide", page_title="Forecast Dashboard", initial_sidebar_state="collapsed")
+st.set_page_config(layout="wide", page_title="Home Dashboard", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
@@ -568,6 +568,21 @@ hr { margin: 6px 0 !important; height: 1px !important; border: none; background:
 </style>
 """, unsafe_allow_html=True)
 
+st.markdown("""
+<style>
+/* Keep the three sections distinct, without heavy backgrounds. */
+.block-container {padding-top:0.65rem !important;padding-bottom:0.5rem !important;}
+[data-testid="stVerticalBlock"] {gap:0.35rem !important;}
+[data-testid="stHeader"] {height:2.1rem;}
+[data-testid="stAppViewContainer"] {background:#f8fafc;}
+.section-heading {font:700 1.05rem/1.3 sans-serif;padding:7px 12px;margin:8px 0 3px;
+ border:1px solid #dce6ef;border-radius:9px;color:#18354d;background:#e7f2fb;}
+.section-heading.spa {background:#fff0df;border-color:#efd8bf;color:#603b24;}
+.section-heading.solar {background:#e7f4e5;border-color:#cde5ca;color:#23552d;}
+.section-note {font-size:.82rem;color:#526272;margin:0 0 5px 3px;}
+</style>
+""", unsafe_allow_html=True)
+
 USER_TZ = ZoneInfo("America/Denver") if ZoneInfo else timezone.utc
 
 if "last_auto_refresh" not in st.session_state:
@@ -587,8 +602,8 @@ for _k in ("temp", "ph", "orp"):
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
-    st.title("⚙️ Settings")
-    st.subheader("📍 Location")
+    st.title("âš™ï¸ Settings")
+    st.subheader("ðŸ“ Location")
     saved_zip = config.get("zip_code", DEFAULT_ZIP)
     zip_input = st.text_input("ZIP code (US)", value=saved_zip)
     if st.button("Save ZIP"):
@@ -604,12 +619,12 @@ with st.sidebar:
         else:
             st.info("Enter a ZIP first.")
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("🌡️ Display")
-    unit_choice = st.radio("Temp unit", ["°F", "°C"], index=0)
-    use_celsius = unit_choice == "°C"
+    st.subheader("ðŸŒ¡ï¸ Display")
+    unit_choice = st.radio("Temp unit", ["Â°F", "Â°C"], index=0)
+    use_celsius = unit_choice == "Â°C"
     auto_refresh_enabled = st.checkbox("Auto-refresh", value=False)
     refresh_minutes = st.number_input("Refresh interval (min)", min_value=1, max_value=120, value=10)
-    if st.button("🔄 Refresh now"):
+    if st.button("ðŸ”„ Refresh now"):
         st.session_state["last_auto_refresh"] = time.time()
         safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
@@ -641,23 +656,23 @@ with st.sidebar:
             st.session_state[f"chem_max_{_k}"] = None
         st.success("Chemistry ranges reset."); safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("☀️ Enphase")
+    st.subheader("â˜€ï¸ Enphase")
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase (public)</a>', unsafe_allow_html=True)
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("📲 Push Alerts")
+    st.subheader("ðŸ“² Push Alerts")
     st.markdown('<span class="signal-badge">via ntfy.sh</span>', unsafe_allow_html=True)
     if NTFY_TOPIC:
-        st.caption(f"✅ Topic: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
+        st.caption(f"âœ… Topic: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
     else:
-        st.warning("NTFY_TOPIC not set — using default.")
-    if st.button("📨 Send test push notification"):
+        st.warning("NTFY_TOPIC not set â€” using default.")
+    if st.button("ðŸ“¨ Send test push notification"):
         try:
-            send_ntfy_message(NTFY_TOPIC, "Test Alert", "✅ Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
+            send_ntfy_message(NTFY_TOPIC, "Test Alert", "âœ… Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
             st.success(f"Test notification sent to: `{NTFY_TOPIC}`")
         except Exception as exc:
             st.error(f"Failed: {exc}")
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("🛁 Arctic Spa")
+    st.subheader("ðŸ› Arctic Spa")
     st.markdown(f'<a href="{ARCTIC_BASE}" target="_blank" rel="noopener noreferrer">Open Arctic Spa portal</a>', unsafe_allow_html=True)
     with st.expander("Local login form (manual only)"):
         st.info("This form is a local convenience only.")
@@ -677,7 +692,7 @@ with st.sidebar:
         st.warning("No Arctic Spa token found in st.secrets.")
     if st.button("Fetch spa status (via secrets)"):
         result = fetch_spa_status_via_service()
-        if result["ok"]: st.success(f"Status OK — HTTP {result['status_code']}"); st.json(result["data"])
+        if result["ok"]: st.success(f"Status OK â€” HTTP {result['status_code']}"); st.json(result["data"])
         else:             st.error(f"Failed: {result['error']}")
 
 # ---------------- Layout ----------------
@@ -759,6 +774,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ---------- Weather: hourly and 5-day panels ----------
+st.markdown('<div class="section-heading">â˜ï¸ Weather Forecast</div>', unsafe_allow_html=True)
 # ---------- Hourly forecast ----------
 if weather_obj:
     now_user  = to_user_tz(now_utc(), USER_TZ)
@@ -785,13 +802,13 @@ if weather_obj:
                 if temp_disp < cold_threshold: color = "#1f77b4"
                 elif temp_disp >= hot_threshold: color = "#d62728"
             img_tag    = f'<img src="{icon_url}" style="width:44px;height:44px;max-width:100%;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
-            feels_html = f'<div style="font-size:11px;margin-top:2px">Feels: {feels}°{"C" if use_celsius else "F"}</div>' if feels is not None and feels != temp_disp else ""
+            feels_html = f'<div style="font-size:11px;margin-top:2px">Feels: {feels}Â°{"C" if use_celsius else "F"}</div>' if feels is not None and feels != temp_disp else ""
             pop_html   = f'<div style="font-size:11px;margin-top:2px">POP: {pop}%</div>' if pop is not None else ""
             card = f'''
             <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:2px 3px;flex:1;min-width:0;box-sizing:border-box;">
               <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:2px">{label}</div>
               <div style="display:flex;align-items:center;justify-content:center;">{img_tag}</div>
-              <div style="text-align:center;font-weight:700;color:{color};margin-top:2px;font-size:1.02rem">{temp_disp if temp_disp is not None else "N/A"}°{"C" if use_celsius else "F"}</div>
+              <div style="text-align:center;font-weight:700;color:{color};margin-top:2px;font-size:1.02rem">{temp_disp if temp_disp is not None else "N/A"}Â°{"C" if use_celsius else "F"}</div>
               <div style="text-align:center">{feels_html}{pop_html}</div>
             </div>'''
             cards.append(card)
@@ -803,8 +820,8 @@ if weather_obj:
           align-items: start; width: 100%; box-sizing: border-box; padding: 2px 0; }}
         @media (max-width: 650px) {{ .responsive-grid {{ grid-template-columns: repeat(3, 1fr); }} }}
         </style>
-        <div style="font-weight:600;font-size:0.95rem;margin-bottom:2px">⏱️ Immediate forecast
-          <span style="font-weight:400;font-size:0.88rem;color:#666">— next {NUM_HOURLY_TO_SHOW} hours</span></div>
+        <div style="font-weight:600;font-size:0.95rem;margin-bottom:2px">Next 6 hours
+          <span style="font-weight:400;font-size:0.88rem;color:#666">â€” next {NUM_HOURLY_TO_SHOW} hours</span></div>
         <div class="responsive-grid">{cards_html}</div>
         """, height=160, scrolling=False)
 else:
@@ -847,8 +864,8 @@ if weather_obj:
             low  = min(temps_display) if temps_display else None
             img_tag   = f'<img src="{icon_url}" style="width:44px;height:44px;max-width:100%;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
             ft        = "C" if use_celsius else "F"
-            low_html  = f'<span style="color:#e05050">{low}°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}°{ft}" if low is not None else "N/A")
-            high_html = f"{high}°{ft}" if high is not None else "N/A"
+            low_html  = f'<span style="color:#e05050">{low}Â°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}Â°{ft}" if low is not None else "N/A")
+            high_html = f"{high}Â°{ft}" if high is not None else "N/A"
             short_texts = [p.get("shortForecast","") for p in [it["period"] for it in bucket] if p.get("shortForecast")]
             common    = max(set(short_texts), key=short_texts.count) if short_texts else ""
             card = f'''
@@ -867,8 +884,8 @@ if weather_obj:
           grid-template-columns: repeat(5, minmax(0, 1fr));
           align-items: start; width: 100%; box-sizing: border-box; padding: 2px 0; }}
         </style>
-        <div style="font-weight:600;font-size:0.95rem;margin-bottom:2px">📅 5-day forecast
-          <span style="font-weight:400;font-size:0.88rem;color:#666">— daily high / low</span></div>
+        <div style="font-weight:600;font-size:0.95rem;margin-bottom:2px">5-day outlook
+          <span style="font-weight:400;font-size:0.88rem;color:#666">â€” daily high / low</span></div>
         <div class="responsive-grid">{cards_html}</div>
         """, height=175, scrolling=False)
 
@@ -880,7 +897,7 @@ spa_result = fetch_spa_status_via_service()
 
 
 if not spa_result.get("ok"):
-    st.info("🛁 Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
+    st.info("ðŸ› Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
 else:
     try:
         spa_test  # noqa: F821
@@ -994,7 +1011,7 @@ else:
         trigger_desc = f"temp {temp_val}F is >4F below setpoint {setpoint_val}F" if temp_below_setpoint else "health indicator"
         reset_line   = ""
         if temp_reset_result is not None:
-            reset_line = f"Action: setpoint re-applied ({setpoint_val} F)" if temp_reset_result.get("ok") else f"Action: failed to re-apply — {temp_reset_result.get('error')}"
+            reset_line = f"Action: setpoint re-applied ({setpoint_val} F)" if temp_reset_result.get("ok") else f"Action: failed to re-apply â€” {temp_reset_result.get('error')}"
         p1_rt = get_pump_runtime_display(1)
         p2_rt = get_pump_runtime_display(2)
         p3_rt = get_pump_runtime_display(3)
@@ -1011,7 +1028,7 @@ else:
         try:
             send_ntfy_message(NTFY_TOPIC, alert_title, "\n".join(message_lines),
                               server=NTFY_SERVER, priority="urgent", tags="warning,bathtub")
-            st.success(f"📲 Push alert sent to ntfy topic: `{NTFY_TOPIC}`")
+            st.success(f"ðŸ“² Push alert sent to ntfy topic: `{NTFY_TOPIC}`")
             st.session_state["last_spa_alert"] = time.time()
         except Exception as exc:
             st.error(f"Failed to send ntfy alert: {exc}")
@@ -1019,12 +1036,12 @@ else:
             if temp_reset_result.get("ok"): st.success(f"Setpoint re-applied: {setpoint_val} F")
             else:                            st.warning(f"Could not re-apply setpoint: {temp_reset_result.get('error')}")
     elif trigger_alert and alert_sent_recently:
-        st.info("⚠️ Alert condition present but rate-limited (1/hr).")
+        st.info("âš ï¸ Alert condition present but rate-limited (1/hr).")
 
     # ---- Build spa card HTML ----
     if trigger_alert:
-        problems_str = " · ".join(reasons) if reasons else "temp below setpoint"
-        alert_banner = f'<div class="alert-banner">⚠️ Alert condition detected — {problems_str}</div>'
+        problems_str = " Â· ".join(reasons) if reasons else "temp below setpoint"
+        alert_banner = f'<div class="alert-banner">âš ï¸ Alert condition detected â€” {problems_str}</div>'
     else:
         alert_banner = ""
 
@@ -1051,7 +1068,7 @@ else:
     if spaboy_connected is not None:
         sb_cls   = "spa-badge-ok" if spaboy_connected else "spa-badge-off"
         sp_label = "SpaBoy " + ("connected" if spaboy_connected else "disconnected")
-        if spaboy_producing: sp_label += " · producing"
+        if spaboy_producing: sp_label += " Â· producing"
         spaboy_html = f'<span class="spa-badge {sb_cls}">{sp_label}</span>'
 
     lights_cls = badge_class(lights)
@@ -1059,10 +1076,10 @@ else:
 
     errors_html = ""
     if errors:
-        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">⚠ {e}</div>' for e in errors)
+        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">âš  {e}</div>' for e in errors)
         errors_html = f'<hr class="spa-divider"><div class="spa-section-label">Errors / Alerts</div>{err_items}'
     else:
-        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">✅ No active errors</div>'
+        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">âœ… No active errors</div>'
 
     filtration_html = ""
     if filtration_frequency or filtration_duration:
@@ -1071,7 +1088,7 @@ else:
     def pump_inline(n, pval):
         rt    = get_pump_runtime_display(n)
         is_on = _is_pump_on(pval)
-        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"●" if is_on else "○"}</span>'
+        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"â—" if is_on else "â—‹"}</span>'
         st_lbl = str(pval or "off")
         return (f'<span style="color:#a0c8e8;font-size:0.82rem">P{n}</span> {dot} '
                 f'<span style="font-size:0.82rem;color:#ccc">{st_lbl}</span> '
@@ -1081,7 +1098,7 @@ else:
     p2_html = pump_inline(2, pump2)
     p3_html = pump_inline(3, pump3)
 
-    temp_html = chem_inline_html("Temp", temp_val, "°F", TEMP_MIN_F, TEMP_MAX_F,
+    temp_html = chem_inline_html("Temp", temp_val, "Â°F", TEMP_MIN_F, TEMP_MAX_F,
                                  st.session_state.get("chem_min_temp"),
                                  st.session_state.get("chem_max_temp"), fmt=".1f")
     ph_html   = chem_inline_html("pH", ph_val, "", PH_MIN, PH_MAX,
@@ -1091,96 +1108,102 @@ else:
                                  st.session_state.get("chem_min_orp"),
                                  st.session_state.get("chem_max_orp"), fmt=".0f")
 
-    inline_styles = """
-    <style>
-    body { margin:0; font-family: sans-serif; }
-    .spa-card { background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
-      border-radius: 8px; padding: 8px 12px; color: #fff; margin-bottom: 0;
-      box-shadow: 0 4px 18px rgba(0,0,0,0.18); }
-    .spa-title { font-size: 1.05rem; font-weight: 700; color: #7ecbf7;
-      letter-spacing: 0.03em; margin-bottom: 3px; }
-    .spa-temp-big { font-size: 2.0rem; font-weight: 800; line-height: 1; }
-    .spa-temp-sub { font-size: 0.88rem; color: #a0c8e8; margin-top: 4px; }
-    .spa-badge { display:inline-flex; align-items:center; gap:6px; padding:2px 6px; border-radius:12px;
-      font-size:0.8rem; font-weight:600; margin:1px 2px 1px 0; }
-    .spa-badge-ok   { background:rgba(40,200,100,0.22);  color:#6effa8; border:1px solid rgba(40,200,100,0.4); }
-    .spa-badge-warn { background:rgba(255,160,0,0.22);   color:#ffd060; border:1px solid rgba(255,160,0,0.4); }
-    .spa-badge-err  { background:rgba(220,60,60,0.22);   color:#ff8080; border:1px solid rgba(220,60,60,0.4); }
-    .spa-badge-off  { background:rgba(120,120,120,0.22); color:#ccc;    border:1px solid rgba(120,120,120,0.3); }
-    .spa-section-label { font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em;
-      color:#7ecbf7; margin-bottom:5px; margin-top:4px; font-weight:600; }
-    .spa-divider { border:none; border-top:1px solid rgba(255,255,255,0.08); margin:4px 0; }
-    .alert-banner { background:linear-gradient(90deg,#7b1a1a,#b02020); border-radius:8px;
-      padding:4px 8px; color:#fff; font-weight:600; margin-bottom:4px; }
-    /* Connection dot */
-    .conn-dot { display:inline-block; width:10px; height:10px; border-radius:50%; flex-shrink:0; }
-    .conn-dot-ok  { background:#3ddc84; box-shadow:0 0 6px #3ddc84; }
-    .conn-dot-err { background:#ff4444; box-shadow:0 0 6px #ff4444; animation: pulse-red 1.5s infinite; }
-    @keyframes pulse-red {
-      0%,100% { box-shadow: 0 0 4px #ff4444; }
-      50%      { box-shadow: 0 0 12px #ff4444; }
-    }
-    </style>
-    """
+    # Three-column light panel. All spa measurements remain on the main page.
+    # Use the existing HTML component on Streamlit 1.65 for older Tizen compatibility.
+    def _display(value, suffix=""):
+        return f"{value}{suffix}" if value is not None else "â€”"
+
+    def _chem_row(label, value, lo, hi, unit, minimum, maximum, fmt):
+        if value is None:
+            status, shown = "Unavailable", "â€”"
+            status_cls = "neutral"
+        else:
+            status_cls = "ok" if lo <= value <= hi else "bad"
+            status = "OK" if status_cls == "ok" else "Check"
+            shown = f"{value:{fmt}}{unit}"
+        day = (f"{minimum:{fmt}}â€“{maximum:{fmt}}" if minimum is not None and maximum is not None else "â€”")
+        return (f'<div class="chem-row"><span>{label}</span><strong>{shown}</strong>'
+                f'<span class="status {status_cls}">{status}</span>'
+                f'<small>Today {day}</small></div>')
+
+    chem_rows = "".join([
+        _chem_row("Temp", temp_val, TEMP_MIN_F, TEMP_MAX_F, "Â°F",
+                  st.session_state.get("chem_min_temp"), st.session_state.get("chem_max_temp"), ".1f"),
+        _chem_row("pH", ph_val, PH_MIN, PH_MAX, "",
+                  st.session_state.get("chem_min_ph"), st.session_state.get("chem_max_ph"), ".2f"),
+        _chem_row("ORP", orp_val, ORP_MIN, ORP_MAX, " mV",
+                  st.session_state.get("chem_min_orp"), st.session_state.get("chem_max_orp"), ".0f"),
+    ])
+    conn_status = "Connected" if connected else "Disconnected" if connected is False else "Unknown"
+    conn_class = "ok" if connected else "bad" if connected is False else "neutral"
+    temp_class = "bad" if temp_below_setpoint else "ok" if temp_val is not None else "neutral"
+    spa_boy_status = ("Producing" if spaboy_producing else "Connected" if spaboy_connected else "Disconnected") if spaboy_connected is not None else "Unknown"
+    pumps_html = "".join(
+        f'<div class="pump-row"><strong>P{n}</strong><span>{_display(v)}</span><small>{get_pump_runtime_display(n)} today</small></div>'
+        for n, v in ((1, pump1), (2, pump2), (3, pump3))
+    )
+    filtration_detail = (f" Â· {filtration_frequency or '?'}Ã—/day Â· {filtration_duration or '?'} min"
+                         if filtration_frequency or filtration_duration else "")
+    issue_html = (f'<div class="issues">âš  {problems_str}</div>' if trigger_alert else
+                  '<div class="no-issues">No active alerts</div>')
+    if errors:
+        issue_html += '<div class="issues">' + ' Â· '.join(str(e) for e in errors) + '</div>'
 
     spa_card_html = f"""
-    <div class="spa-card">
-      {alert_banner}
-      <div class="spa-title">🛁 Monisha's Tub — Live Status</div>
-
-      <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;">
-        <div>
-          <div class="spa-temp-big" style="color:{temp_color}">{temp if temp is not None else "—"} °F</div>
-          <div class="spa-temp-sub">Setpoint: {setpoint or "—"} °F</div>
-        </div>
-        <div style="padding-bottom:4px">
-          {conn_html}
-          {spaboy_html}
-        </div>
-      </div>
-
-      <hr class="spa-divider">
-
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;line-height:1.3">
-        {temp_html} &nbsp;·&nbsp; {ph_html} &nbsp;·&nbsp; {orp_html}
-      </div>
-
-      <hr class="spa-divider">
-
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;line-height:1.3">
-        {p1_html} &nbsp;·&nbsp; {p2_html} &nbsp;·&nbsp; {p3_html}
-      </div>
-      <div style="font-size:0.7rem;color:#3a5a70;margin-top:2px">runtime today · resets midnight</div>
-
-      <hr class="spa-divider">
-
-      <span class="spa-badge {lights_cls}">Lights: {lights or "?"}</span>
-      <span class="spa-badge {filter_cls}">Filter: {filter_status or "?"}</span>
-      {filtration_html}
-
-      {errors_html}
-    </div>
+    <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+    *{{box-sizing:border-box}} body{{margin:0;font-family:Arial,sans-serif;color:#243447;background:#fff}}
+    .spa-card{{border:1px solid #efd8bf;border-radius:9px;padding:10px 12px;background:#fff;}}
+    .three{{display:grid;grid-template-columns:1.05fr 1fr 1.45fr;gap:0;}}
+    .col{{padding:3px 12px;min-width:0;}}
+    .col:first-child{{padding-left:2px}} .col+.col{{border-left:1px solid #dce2e8}}
+    .subhead{{font-size:12px;font-weight:700;color:#64748b;margin:0 0 8px}}
+    .temperature{{font-size:32px;font-weight:800;color:#273d4d;line-height:1.1}}
+    .temperature.bad{{color:#b42318}} .setpoint{{font-size:14px;margin:5px 0 9px}}
+    .status{{display:inline-block;padding:2px 7px;border-radius:12px;font-size:11px;font-weight:700;white-space:nowrap}}
+    .status.ok{{background:#def4e4;color:#146c38}} .status.bad{{background:#ffe0dc;color:#a62319}}
+    .status.neutral{{background:#edf0f3;color:#53616d}}
+    .detail{{font-size:12px;margin:5px 0;line-height:1.35}}
+    .pump-row{{display:grid;grid-template-columns:30px 1fr auto;gap:5px;align-items:center;font-size:13px;
+      padding:3px 0;border-bottom:1px solid #edf0f3}}
+    .pump-row small{{font-size:11px;color:#637383}}
+    .chem-row{{display:grid;grid-template-columns:40px minmax(68px,1fr) 48px minmax(78px,1fr);
+      gap:5px;align-items:center;padding:5px 0;border-bottom:1px solid #edf0f3;font-size:13px}}
+    .chem-row small{{font-size:10px;color:#637383;white-space:nowrap}}
+    .issues{{background:#fff1ed;color:#a62319;padding:5px 7px;margin-top:7px;border-radius:5px;font-size:12px}}
+    .no-issues{{color:#217447;font-size:11px;margin-top:6px}}
+    @media(max-width:650px){{.three{{grid-template-columns:1fr 1fr}} .col:last-child{{grid-column:1/-1;
+      border-left:0;border-top:1px solid #dce2e8;padding-top:8px;margin-top:7px}}}}
+    </style></head><body><div class="spa-card"><div class="three">
+      <div class="col"><div class="subhead">WATER TEMPERATURE</div>
+        <div class="temperature {temp_class}">{_display(temp, ' Â°F')}</div>
+        <div class="setpoint">Setpoint: <strong>{_display(setpoint, ' Â°F')}</strong></div>
+        <div class="detail">Connection: <span class="status {conn_class}">{conn_status}</span></div>
+        <div class="detail">SpaBoy: {spa_boy_status}</div></div>
+      <div class="col"><div class="subhead">PUMPS &amp; EQUIPMENT</div>
+        {pumps_html}
+        <div class="detail">Lights: <strong>{_display(lights)}</strong></div>
+        <div class="detail">Filter: <strong>{_display(filter_status)}</strong>{filtration_detail}</div></div>
+      <div class="col"><div class="subhead">WATER CHEMISTRY Â· DAILY MINâ€“MAX</div>
+        {chem_rows}
+        <div class="detail" style="font-size:10px;color:#64748b">Safe pH {PH_MIN}â€“{PH_MAX} Â· ORP {ORP_MIN}â€“{ORP_MAX} mV</div></div>
+    </div>{issue_html}</div></body></html>
     """
-
-    st.components.v1.html(inline_styles + spa_card_html, height=245, scrolling=False)
+    st.components.v1.html(spa_card_html, height=225 if not trigger_alert else 275, scrolling=False)
 
     with st.expander("Raw spa payload (debug)"):
         st.json(spa)
 
 
 
-# ---------- Solar panel: available on demand without reserving 540px ----------
-with st.expander("☀️ Enphase solar panels — open graph", expanded=False):
-    try:
-        st.components.v1.iframe(ENPHASE_PUBLIC_URL, height=380)
-    except Exception:
-        st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase graph</a>', unsafe_allow_html=True)
-    st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open full graph in new tab</a>', unsafe_allow_html=True)
+# ---------- Solar: link only. No unsupported real-time solar measurements. ----------
+st.markdown('<div class="section-heading solar">â˜€ï¸ Solar System (Enphase)</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="section-note">Production and system details are available on the Enphase website. '
+    f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">'
+    f'Open Solar System â†—</a></div>', unsafe_allow_html=True)
 
-with st.expander("Dashboard information / diagnostics", expanded=False):
-    st.caption("Hourly forecast · Feels-like · POP · Pump runtimes · Daily chemistry ranges · ntfy alerts")
-
-if st.checkbox("Show debug", value=False):
+if st.sidebar.checkbox("Show debug", value=False):
     st.write("config:", config)
     st.write("zip:", zip_to_use)
     st.write("chem_ranges:", config.get("chem_ranges", {}))
