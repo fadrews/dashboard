@@ -964,6 +964,31 @@ def _html_text(value):
     from html import escape
     return escape(str(value), quote=True).encode("ascii", "xmlcharrefreplace").decode("ascii")
 
+def _spa_flag(value):
+    """Interpret optional API status without treating string 'false' as True."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in ("true", "1", "yes", "on", "connected", "producing", "active"):
+        return True
+    if normalized in ("false", "0", "no", "off", "disconnected", "not producing", "inactive"):
+        return False
+    return None
+
+
+def _spa_indicator(value, positive_label, negative_label, *, negative_style="bad"):
+    """Generate the same compact status badge used by the spa connection."""
+    status = _spa_flag(value)
+    if status is True:
+        label, style = positive_label, "ok"
+    elif status is False:
+        label, style = negative_label, negative_style
+    else:
+        label, style = "Unknown", "neutral"
+    return f'<span class="spa-status {style}">{_html_text(label)}</span>'
+
 def _checked_footer(timestamp, *, note=None):
     value = _html_text(_local_timestamp(timestamp)) if timestamp else "Not available"
     note_html = (f'<span class="footer-alert">{_html_text(note)}</span>' if note else "")
@@ -1181,13 +1206,6 @@ else:
 
     temp_color = "#ff6060" if (temp_val is not None and temp_val < 4) else "#7ef7c8"
 
-    spaboy_html = ""
-    if spaboy_connected is not None:
-        sb_cls   = "spa-badge-ok" if spaboy_connected else "spa-badge-off"
-        sp_label = "SpaBoy " + ("connected" if spaboy_connected else "disconnected")
-        if spaboy_producing: sp_label += " Â· producing"
-        spaboy_html = f'<span class="spa-badge {sb_cls}">{sp_label}</span>'
-
     lights_cls = badge_class(lights)
     filter_cls = badge_class(filter_status)
 
@@ -1255,9 +1273,12 @@ else:
     conn_status = "Connected" if connected else "Disconnected" if connected is False else "Unknown"
     conn_class = "ok" if connected else "bad" if connected is False else "neutral"
     temp_class = "bad" if temp_below_setpoint else "ok" if temp_val is not None else "neutral"
-    spa_boy_status = (
-        "Producing" if spaboy_producing else "Connected" if spaboy_connected else "Disconnected"
-    ) if spaboy_connected is not None else "Unknown"
+    # Connection and sanitizer production are independent observations.
+    # Green mirrors the spa connection badge; gray means idle or unknown.
+    spaboy_connection_html = _spa_indicator(
+        spaboy_connected, "Connected", "Disconnected")
+    spaboy_production_html = _spa_indicator(
+        spaboy_producing, "Producing", "Not producing", negative_style="neutral")
     pumps_html = "".join(
         f'<div class="spa-pump-row"><strong>P{n}</strong>'
         f'<span>{_display(v)}</span>'
@@ -1286,8 +1307,9 @@ else:
             '<div class="spa-col"><div class="spa-subhead">WATER TEMPERATURE</div>'
               f'<div class="spa-temperature {temp_class}">{_display(temp, " &deg;F")}</div>'
               f'<div class="spa-setpoint">Setpoint: <strong>{_display(setpoint, " &deg;F")}</strong></div>'
-              f'<div class="spa-detail">Connection: <span class="spa-status {conn_class}">{conn_status}</span></div>'
-              f'<div class="spa-detail">SpaBoy: {_html_text(spa_boy_status)}</div></div>'
+              f'<div class="spa-detail">Spa connection: <span class="spa-status {conn_class}">{conn_status}</span></div>'
+              f'<div class="spa-detail">SpaBoy connection: {spaboy_connection_html}</div>'
+              f'<div class="spa-detail">SpaBoy production: {spaboy_production_html}</div></div>'
             '<div class="spa-col"><div class="spa-subhead">PUMPS &amp; EQUIPMENT</div>'
               f'{pumps_html}'
               f'<div class="spa-detail">Lights: <strong>{_display(lights)}</strong></div>'
