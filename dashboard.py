@@ -12,6 +12,8 @@ import sys
 import time
 import math
 import hashlib
+import logging
+import threading
 import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, date
@@ -170,6 +172,8 @@ def _call_pump_set(spa_id, pump_id, speed):
 
 # ---------------- Constants / Paths ----------------
 CONFIG_PATH    = Path(".user_config.json")
+RUNTIME_PATH   = Path(".dashboard_runtime.json")
+EVENT_LOG_PATH = Path(".dashboard_events.jsonl")
 ICON_CACHE_DIR = Path(".cache_icons")
 ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -182,6 +186,10 @@ ARCTIC_SPA_PORTAL_HINT = "https://myarcticspa.com/spa/SpaAPIManagement.aspx"
 PH_MIN,   PH_MAX   = 7.1, 7.9 #.2 .8
 ORP_MIN,  ORP_MAX  = 520, 700 #600 800
 TEMP_MIN_F, TEMP_MAX_F = 95.0, 104.0
+SPA_POLL_SECONDS = 3600              # One API check per hour, per running server
+SPA_RETRY_SECONDS = 600             # Back off 10 minutes after a failed check
+ALERT_COOLDOWN_SECONDS = 14400      # Four hours, shared by browser sessions
+MAX_PUMP_INTERVAL_SECONDS = 5400    # Longer gaps cannot be estimated responsibly
 
 # ---------------- Utilities ----------------
 def safe_rerun():
@@ -238,8 +246,12 @@ def load_config():
 
 def save_config(cfg):
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+        # Avoid leaving truncated JSON if a page reloads during a write.
+        with _ops_lock():
+            tmp = CONFIG_PATH.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as file:
+                json.dump(cfg, file, indent=2)
+            os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         st.error(f"Failed to save config: {e}")
 
@@ -251,8 +263,176 @@ def clear_config():
 
 config = load_config()
 
+
+# ---------- Server-shared operational state and audit events ----------
+# These files persist across browser sessions on ONE Streamlit server instance.
+# Streamlit Community Cloud may delete them on restart/redeployment. No API
+# tokens, login credentials or raw spa payloads are written to event logs.
+LOGGER = logging.getLogger("home_dashboard")
+if not LOGGER.handlers:
+    LOGGER.addHandler(logging.StreamHandler())
+LOGGER.setLevel(logging.INFO)
+
+@st.cache_resource
+def _ops_lock():
+    return threading.RLock()
+
+def _read_ops():
+    try:
+        with RUNTIME_PATH.open("r", encoding="utf-8") as file:
+            obj = json.load(file)
+            return obj if isinstance(obj, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+def _write_ops(state):
+    # Atomic replacement prevents partial JSON files on routine interruptions.
+    temporary = RUNTIME_PATH.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(state, file, ensure_ascii=False, default=str)
+    os.replace(temporary, RUNTIME_PATH)
+
+def _event(event_type, **details):
+    record = {"at": datetime.now(timezone.utc).isoformat(), "type": event_type, **details}
+    line = json.dumps(record, ensure_ascii=False, default=str)
+    LOGGER.info("dashboard_event %s", line)
+    try:
+        with EVENT_LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+    except OSError as exc:
+        LOGGER.warning("Could not append dashboard event: %s", exc)
+
+def _last_events(count=30):
+    try:
+        with EVENT_LOG_PATH.open("r", encoding="utf-8") as file:
+            return file.readlines()[-count:]
+    except OSError:
+        return []
+
+def _spa_result_from_ops(ops):
+    snapshot = ops.get("spa_snapshot")
+    if isinstance(snapshot, dict):
+        return {"ok": True, "data": snapshot,
+                "status_code": ops.get("spa_status_code"),
+                "checked_at": ops.get("spa_checked_at"),
+                "stale": not ops.get("spa_attempt_ok", False),
+                "error": ops.get("spa_last_error")}
+    return {"ok": False, "data": None, "checked_at": None,
+            "stale": True, "error": ops.get("spa_last_error") or "No successful spa reading yet"}
+
+def get_spa_status_throttled():
+    # Unlike Session State this gate is shared by all open browser sessions.
+    # There is no background polling: a new check requires a script execution.
+    with _ops_lock():
+        state = _read_ops()
+        now = time.time()
+        prior = float(state.get("spa_attempt_ts") or 0)
+        interval = SPA_POLL_SECONDS if state.get("spa_attempt_ok") else SPA_RETRY_SECONDS
+        if prior and now - prior < interval:
+            return _spa_result_from_ops(state)
+        result = fetch_spa_status_via_service()
+        state["spa_attempt_ts"] = now
+        state["spa_attempt_ok"] = bool(result.get("ok"))
+        state["spa_last_error"] = result.get("error")
+        if result.get("ok"):
+            data = result.get("data")
+            if not isinstance(data, dict):
+                try:
+                    data = data.to_dict() if hasattr(data, "to_dict") else dict(data)
+                except Exception:
+                    data = {}
+            state["spa_snapshot"] = data
+            state["spa_status_code"] = result.get("status_code")
+            state["spa_checked_at"] = now
+        _write_ops(state)
+        _event("SPA_POLL", success=bool(result.get("ok")),
+               status_code=result.get("status_code"), error=result.get("error"))
+        return _spa_result_from_ops(state)
+
+def _local_timestamp(unix_ts):
+    if not unix_ts:
+        return "Never"
+    return datetime.fromtimestamp(float(unix_ts), USER_TZ).strftime("%b %d, %-I:%M %p")
+
+def process_new_spa_observation(spa, checked_at, *, trigger_alert, reasons,
+                                temp_below_setpoint, temp_val, setpoint_val,
+                                ph_val, orp_val, connected, filter_status,
+                                ph_status, orp_status, errors):
+    """At most once for each real API sample, across refrigerator sessions."""
+    if not checked_at:
+        return {}
+    with _ops_lock():
+        ops = _read_ops()
+        if ops.get("spa_processed_at") == checked_at:
+            return {}
+        ops["spa_processed_at"] = checked_at  # claim first: avoid duplicate commands
+        _write_ops(ops)
+
+        # Reload config before writes so stale browser sessions do not overwrite
+        # the latest stored chemistry/runtime records.
+        config.clear()
+        config.update(load_config())
+        update_pump_runtimes({1: spa.get("pump1"), 2: spa.get("pump2"),
+                              3: spa.get("pump3")}, USER_TZ, sampled_at=checked_at)
+        update_chem_ranges_persistent(temp_val, ph_val, orp_val, USER_TZ)
+        _event("SPA_STATUS", sampled_at=checked_at, temp_f=temp_val,
+               target_f=setpoint_val, connected=connected, ph=ph_val,
+               orp_mv=orp_val, pumps=[spa.get("pump1"), spa.get("pump2"), spa.get("pump3")],
+               alert=trigger_alert)
+
+        outcome = {}
+        if not temp_below_setpoint:
+            ops["setpoint_incident_active"] = False
+        elif not ops.get("setpoint_incident_active"):
+            # One command per continuous low-temperature incident, even if
+            # the app is reloaded/reconnected. Never re-send due to reruns.
+            ops["setpoint_incident_active"] = True
+            ops["setpoint_attempt_ts"] = time.time()
+            _write_ops(ops)
+            spa_id = spa.get("id") or spa.get("spa_id") or spa.get("spaId")
+            if spa_id and setpoint_val is not None and connected is not False:
+                result = _call_temperature_set(spa_id, (setpoint_val - 32.0) * 5.0 / 9.0)
+            else:
+                result = {"ok": False, "error": "spa id/setpoint missing or disconnected"}
+            outcome["setpoint"] = result
+            _event("SPA_SETPOINT", success=bool(result.get("ok")),
+                   error=result.get("error"), incident="low_temperature")
+
+        if trigger_alert:
+            last_sent_or_attempted = float(ops.get("alert_attempt_ts") or 0)
+            if time.time() - last_sent_or_attempted >= ALERT_COOLDOWN_SECONDS:
+                # Reserve cooldown before network request (ambiguous failures
+                # must not trigger a burst of duplicate notifications).
+                ops["alert_attempt_ts"] = time.time()
+                _write_ops(ops)
+                message = [
+                    "Time: " + _local_timestamp(checked_at),
+                    f"Temperature: {temp_val if temp_val is not None else 'N/A'} F  |  Setpoint: {setpoint_val if setpoint_val is not None else 'N/A'} F",
+                    "Issues: " + (", ".join(reasons) if reasons else "temperature below setpoint"),
+                    f"Connected: {connected}; pumps: {spa.get('pump1')}, {spa.get('pump2')}, {spa.get('pump3')}",
+                    f"Filter: {filter_status}; pH: {ph_val} ({ph_status}); ORP: {orp_val} ({orp_status})",
+                    f"Spa errors: {errors or 'none'}",
+                ]
+                if "setpoint" in outcome:
+                    message.append("Setpoint reapplication: " +
+                                   ("success" if outcome["setpoint"].get("ok") else "failed"))
+                try:
+                    send_ntfy_message(NTFY_TOPIC, "Spa Alert: Monisha's Tub", "\n".join(message),
+                                      server=NTFY_SERVER, priority="urgent", tags="warning,bathtub")
+                    outcome["notification"] = "sent"
+                    _event("SPA_ALERT", success=True, reasons=reasons)
+                except Exception as exc:
+                    outcome["notification"] = "failed"
+                    _event("SPA_ALERT", success=False, error=str(exc), reasons=reasons)
+            else:
+                _event("SPA_ALERT_SUPPRESSED", reason="four_hour_cooldown")
+        ops["alert_condition_active"] = bool(trigger_alert)
+        _write_ops(ops)
+        return outcome
+
+
 # ============================================================
-# PERSISTENT CHEMISTRY RANGE — survives browser refresh
+# PERSISTENT CHEMISTRY RANGE â€” survives browser refresh
 # ============================================================
 # Stored in .user_config.json under key "chem_ranges":
 #   { "date": "YYYY-MM-DD",
@@ -358,7 +538,7 @@ def geocode_zip_to_latlon_cached(zip_code):
     place = d["places"][0]
     return float(place["latitude"]), float(place["longitude"])
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=900)
 def get_nws_forecast_cached(lat, lon):
     base    = "https://api.weather.gov/points/{lat},{lon}"
     headers = {"User-Agent": "streamlit-nws-app (contact@example.com)"}
@@ -374,127 +554,97 @@ def get_nws_forecast_cached(lat, lon):
     if forecast_hourly_url:
         rh = retry_request("GET", forecast_hourly_url, headers=headers, timeout=10)
         rh.raise_for_status(); forecast_hourly = rh.json()
-    return {"point": point, "forecast": forecast, "forecastHourly": forecast_hourly}
+    fetched_at = time.time()
+    _event("WEATHER_UPDATE", success=True, fetched_at=fetched_at)
+    return {"point": point, "forecast": forecast, "forecastHourly": forecast_hourly, "fetched_at": fetched_at}
+
 
 
 # ============================================================
-# PUMP RUNTIME TRACKING — persisted to disk
+# PUMP RUNTIME ESTIMATE: two hourly state observations, not exact telemetry.
+# Assumes unchanged ON means running throughout the interval, a state change
+# means running half the interval, and unchanged OFF means none. Long gaps
+# (>90 minutes) are excluded instead of inventing unknown hours of runtime.
+# Update ONLY when a new successful spa API sample is obtained.
 # ============================================================
-# Stored in .user_config.json under key "pump_runtimes":
-#   {
-#     "date": "YYYY-MM-DD",          # resets daily
-#     "1": { "daily_seconds": float, "on_since": float|null, "last_state": str|null },
-#     "2": { ... },
-#     "3": { ... }
-#   }
-#
-# "on_since" is a Unix timestamp written to disk when the pump turns on.
-# On the next load (even after a browser refresh), we know the pump was
-# already running since that timestamp, so we correctly accumulate elapsed
-# time without losing anything between refreshes.
-#
-# State machine per pump (new_on vs prev_on from persisted last_state):
-#   off→on  : record on_since = now
-#   on→on   : daily_seconds += (now - on_since), reset on_since = now
-#   on→off  : daily_seconds += (now - on_since), clear on_since
-#   off→off : nothing
-# ============================================================
-
 def _is_pump_on(val):
-    if val is None: return False
+    if val is None:
+        return None  # Unknown is not the same as OFF
     s = str(val).strip().lower()
-    if s in ("on","1","true","running","high","low","medium"): return True
-    try:    return float(s) > 0
-    except: return False
+    if s in ("on", "1", "true", "running", "high", "low", "medium"):
+        return True
+    if s in ("off", "0", "false", "stopped", "disabled", ""):
+        return False
+    try:
+        return float(s) > 0
+    except (TypeError, ValueError):
+        return None
 
-def _today_str(user_tz): return datetime.now(user_tz).strftime("%Y-%m-%d")
+def _today_str(user_tz):
+    return datetime.now(user_tz).strftime("%Y-%m-%d")
 
-def _load_pump_runtimes(user_tz) -> Dict[str, Any]:
-    """Load today's pump runtime state from config, resetting if date rolled over."""
-    today  = _today_str(user_tz)
-    stored = config.get("pump_runtimes", {})
-    if not isinstance(stored, dict) or stored.get("date") != today:
-        # New day — start fresh but keep the structure
-        return {"date": today,
-                "1": {"daily_seconds": 0.0, "on_since": None, "last_state": None},
-                "2": {"daily_seconds": 0.0, "on_since": None, "last_state": None},
-                "3": {"daily_seconds": 0.0, "on_since": None, "last_state": None}}
-    # Ensure all pump keys exist (defensive)
-    for n in ["1","2","3"]:
-        stored.setdefault(n, {"daily_seconds": 0.0, "on_since": None, "last_state": None})
+def _load_pump_runtimes(user_tz):
+    today = _today_str(user_tz)
+    stored = config.get("pump_runtimes") or {}
+    if not isinstance(stored, dict):
+        stored = {}
+    if stored.get("date") != today:
+        # Keep prior observed state/time across midnight, but reset totals.
+        stored = {"date": today, "last_sample_ts": stored.get("last_sample_ts")}
+        for n in (1, 2, 3):
+            old = (config.get("pump_runtimes") or {}).get(str(n), {})
+            stored[str(n)] = {"daily_seconds": 0.0,
+                              "last_state": old.get("last_state")}
+    for n in (1, 2, 3):
+        stored.setdefault(str(n), {"daily_seconds": 0.0, "last_state": None})
     return stored
 
-def _save_pump_runtimes(runtimes: Dict[str, Any]) -> None:
+def update_pump_runtimes(pump_vals, user_tz, sampled_at=None):
+    sample_ts = float(sampled_at if sampled_at is not None else time.time())
+    runtimes = _load_pump_runtimes(user_tz)
+    prior_ts = runtimes.get("last_sample_ts")
+    today_start = datetime.combine(datetime.fromtimestamp(sample_ts, user_tz).date(),
+                                   datetime.min.time(), tzinfo=user_tz).timestamp()
+    elapsed = sample_ts - float(prior_ts) if prior_ts is not None else None
+    eligible = elapsed is not None and 0 < elapsed <= MAX_PUMP_INTERVAL_SECONDS
+    span = max(0.0, sample_ts - max(float(prior_ts), today_start)) if eligible else 0.0
+    for n in (1, 2, 3):
+        key = str(n)
+        entry = runtimes[key]
+        old_state = _is_pump_on(entry.get("last_state"))
+        new_state = _is_pump_on(pump_vals.get(n))
+        increment = 0.0
+        if eligible and old_state is not None and new_state is not None:
+            if old_state and new_state:
+                increment = span
+            elif old_state != new_state:
+                increment = span / 2.0
+        entry["daily_seconds"] = float(entry.get("daily_seconds") or 0) + increment
+        entry["last_state"] = pump_vals.get(n)
+        st.session_state[f"pump_daily_seconds_{n}"] = entry["daily_seconds"]
+        st.session_state[f"pump_state_{n}"] = entry["last_state"]
+    runtimes["last_sample_ts"] = sample_ts
     config["pump_runtimes"] = runtimes
     save_config(config)
+    _event("PUMP_OBSERVATION", sample_ts=sample_ts,
+           interval_seconds=round(elapsed) if elapsed is not None else None,
+           interval_estimated=eligible,
+           states={str(n): pump_vals.get(n) for n in (1, 2, 3)},
+           minutes={str(n): round(runtimes[str(n)]["daily_seconds"] / 60)
+                    for n in (1, 2, 3)})
 
-def update_pump_runtimes(pump_vals: Dict[int, Any], user_tz) -> None:
-    """
-    Call once per app load. pump_vals: {1: pump1_val, 2: pump2_val, 3: pump3_val}
-    Reads persisted state, applies transitions, writes back to disk.
-    Also syncs session_state for get_pump_runtime_display().
-    """
-    now_ts   = time.time()
+def _sync_pump_session(user_tz):
     runtimes = _load_pump_runtimes(user_tz)
-    changed  = False
+    for n in (1, 2, 3):
+        entry = runtimes[str(n)]
+        st.session_state[f"pump_daily_seconds_{n}"] = float(entry.get("daily_seconds") or 0)
+        st.session_state[f"pump_state_{n}"] = entry.get("last_state")
 
-    for n in [1, 2, 3]:
-        key      = str(n)
-        entry    = runtimes[key]
-        new_val  = pump_vals.get(n)
-        new_on   = _is_pump_on(new_val)
-        prev_on  = _is_pump_on(entry.get("last_state"))
-        on_since = entry.get("on_since")          # persisted Unix timestamp or None
-        daily    = float(entry.get("daily_seconds", 0.0))
-
-        if new_on and prev_on:
-            # Was on, still on — accumulate time since last checkpoint
-            if on_since is not None:
-                daily += now_ts - on_since
-            entry["daily_seconds"] = daily
-            entry["on_since"]      = now_ts       # reset checkpoint to now
-            changed = True
-
-        elif new_on and not prev_on:
-            # Just turned on (or first load after refresh while pump is on)
-            # If on_since is already set from a previous session, honour it
-            # (pump was already running before refresh — don't double-count)
-            if on_since is None:
-                entry["on_since"] = now_ts
-                changed = True
-            # else: on_since already persisted, no change needed
-
-        elif not new_on and prev_on:
-            # Just turned off — finalise
-            if on_since is not None:
-                daily += now_ts - on_since
-            entry["daily_seconds"] = daily
-            entry["on_since"]      = None
-            changed = True
-
-        # off→off: nothing to update
-
-        entry["last_state"] = str(new_val) if new_val is not None else None
-
-        # Mirror into session_state for get_pump_runtime_display()
-        st.session_state[f"pump_daily_seconds_{n}"] = entry["daily_seconds"]
-        st.session_state[f"pump_on_since_{n}"]      = entry["on_since"]
-        st.session_state[f"pump_state_{n}"]         = entry["last_state"]
-
-    if changed:
-        _save_pump_runtimes(runtimes)
-
-def get_pump_runtime_display(n: int) -> str:
-    """Return formatted runtime string, including live (un-checkpointed) time."""
-    now_ts    = time.time()
-    daily_sec = float(st.session_state.get(f"pump_daily_seconds_{n}", 0))
-    on_since  = st.session_state.get(f"pump_on_since_{n}")
-    if on_since is not None:
-        daily_sec += now_ts - on_since      # live accumulation since last checkpoint
-    hours   = int(daily_sec // 3600)
-    minutes = int((daily_sec % 3600) // 60)
-    return f"{hours}h {minutes:02d}m" if hours > 0 else f"{minutes}m"
-
+def get_pump_runtime_display(n):
+    # Show time accumulated up to last observation. No guessed live minutes.
+    seconds = float(st.session_state.get(f"pump_daily_seconds_{n}") or 0)
+    hours, minutes = divmod(int(seconds // 60), 60)
+    return f"~{hours}h {minutes:02d}m" if hours else f"~{minutes}m"
 
 def chem_inline_html(label, value, unit, safe_lo, safe_hi, day_min, day_max, fmt=".1f"):
     if value is None:
@@ -503,9 +653,9 @@ def chem_inline_html(label, value, unit, safe_lo, safe_hi, day_min, day_max, fmt
     val_color = "#14753b" if in_range else "#b42318"
     val_str   = f"{value:{fmt}}"
     if day_min is not None and day_max is not None:
-        range_str = f"{day_min:{fmt}}–{day_max:{fmt}}"
+        range_str = f"{day_min:{fmt}}â€“{day_max:{fmt}}"
     else:
-        range_str = "—"
+        range_str = "â€”"
     return (f'<span style="font-size:0.82rem;color:#475569">{label}:</span> '
             f'<span style="font-weight:700;color:{val_color}">{val_str}{unit}</span> '
             f'<span style="font-size:0.74rem;color:#64748b">[{range_str}]</span>')
@@ -546,12 +696,9 @@ st.markdown("""<style>
 
 USER_TZ = ZoneInfo("America/Denver") if ZoneInfo else timezone.utc
 
-if "last_auto_refresh" not in st.session_state:
-    st.session_state["last_auto_refresh"] = time.time()
-
 # Initialise runtime session keys
 for _n in [1, 2, 3]:
-    for _k in [f"pump_daily_seconds_{_n}", f"pump_on_since_{_n}", f"pump_state_{_n}"]:
+    for _k in [f"pump_daily_seconds_{_n}", f"pump_state_{_n}"]:
         if _k not in st.session_state:
             st.session_state[_k] = None if ("_state_" in _k or "_since_" in _k) else 0
 if "pump_runtime_date" not in st.session_state:
@@ -563,8 +710,8 @@ for _k in ("temp", "ph", "orp"):
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
-    st.title("⚙️ Settings")
-    st.subheader("📍 Location")
+    st.title("âš™ï¸ Settings")
+    st.subheader("ðŸ“ Location")
     saved_zip = config.get("zip_code", DEFAULT_ZIP)
     zip_input = st.text_input("ZIP code (US)", value=saved_zip)
     if st.button("Save ZIP"):
@@ -580,13 +727,11 @@ with st.sidebar:
         else:
             st.info("Enter a ZIP first.")
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("🌡️ Display")
-    unit_choice = st.radio("Temp unit", ["°F", "°C"], index=0)
-    use_celsius = unit_choice == "°C"
-    auto_refresh_enabled = st.checkbox("Auto-refresh", value=False)
-    refresh_minutes = st.number_input("Refresh interval (min)", min_value=1, max_value=120, value=10)
-    if st.button("🔄 Refresh now"):
-        st.session_state["last_auto_refresh"] = time.time()
+    st.subheader("ðŸŒ¡ï¸ Display")
+    unit_choice = st.radio("Temp unit", ["Â°F", "Â°C"], index=0)
+    use_celsius = unit_choice == "Â°C"
+    st.caption("Weather updates while this browser session is active; spa checks no more than hourly.")
+    if st.button("Refresh display now"):
         safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     if st.button("Clear stored ZIP"):
@@ -594,18 +739,15 @@ with st.sidebar:
             del config["zip_code"]
             save_config(config)
         st.success("Cleared stored ZIP."); safe_rerun()
-    if st.button("Clear caches"):
-        st.cache_data.clear(); st.success("Caches cleared."); safe_rerun()
+    if st.button("Clear weather/geocode caches"):
+        st.cache_data.clear(); st.success("Weather/geocode caches cleared."); safe_rerun()
     if st.button("Reset pump runtimes"):
-        empty = {"date": "",
-                 "1": {"daily_seconds": 0.0, "on_since": None, "last_state": None},
-                 "2": {"daily_seconds": 0.0, "on_since": None, "last_state": None},
-                 "3": {"daily_seconds": 0.0, "on_since": None, "last_state": None}}
+        empty = {"date": "", "last_sample_ts": None,
+                 **{str(n): {"daily_seconds": 0.0, "last_state": None} for n in (1, 2, 3)}}
         config["pump_runtimes"] = empty
         save_config(config)
         for _n in [1, 2, 3]:
             st.session_state[f"pump_daily_seconds_{_n}"] = 0
-            st.session_state[f"pump_on_since_{_n}"]      = None
             st.session_state[f"pump_state_{_n}"]         = None
         st.success("Pump runtimes reset."); safe_rerun()
     if st.button("Reset chem ranges"):
@@ -617,23 +759,23 @@ with st.sidebar:
             st.session_state[f"chem_max_{_k}"] = None
         st.success("Chemistry ranges reset."); safe_rerun()
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("☀️ Enphase")
+    st.subheader("â˜€ï¸ Enphase")
     st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase (public)</a>', unsafe_allow_html=True)
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("📲 Push Alerts")
+    st.subheader("ðŸ“² Push Alerts")
     st.markdown('<span class="signal-badge">via ntfy.sh</span>', unsafe_allow_html=True)
     if NTFY_TOPIC:
-        st.caption(f"✅ Topic: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
+        st.caption(f"âœ… Topic: `{NTFY_TOPIC}`  |  Server: `{NTFY_SERVER}`")
     else:
-        st.warning("NTFY_TOPIC not set — using default.")
-    if st.button("📨 Send test push notification"):
+        st.warning("NTFY_TOPIC not set â€” using default.")
+    if st.button("ðŸ“¨ Send test push notification"):
         try:
-            send_ntfy_message(NTFY_TOPIC, "Test Alert", "✅ Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
+            send_ntfy_message(NTFY_TOPIC, "Test Alert", "âœ… Test message from your Streamlit dashboard!", server=NTFY_SERVER, priority="default", tags="white_check_mark")
             st.success(f"Test notification sent to: `{NTFY_TOPIC}`")
         except Exception as exc:
             st.error(f"Failed: {exc}")
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.subheader("🛁 Arctic Spa")
+    st.subheader("ðŸ› Arctic Spa")
     st.markdown(f'<a href="{ARCTIC_BASE}" target="_blank" rel="noopener noreferrer">Open Arctic Spa portal</a>', unsafe_allow_html=True)
     with st.expander("Local login form (manual only)"):
         st.info("This form is a local convenience only.")
@@ -651,9 +793,9 @@ with st.sidebar:
         st.caption("Using token from Streamlit secrets.")
     else:
         st.warning("No Arctic Spa token found in st.secrets.")
-    if st.button("Fetch spa status (via secrets)"):
-        result = fetch_spa_status_via_service()
-        if result["ok"]: st.success(f"Status OK — HTTP {result['status_code']}"); st.json(result["data"])
+    if st.button("Show latest stored spa status"):
+        result = _spa_result_from_ops(_read_ops())
+        if result["ok"]: st.success(f"Status OK â€” HTTP {result['status_code']}"); st.json(result["data"])
         else:             st.error(f"Failed: {result['error']}")
 
 # ---------------- Layout ----------------
@@ -664,33 +806,22 @@ except Exception as e:
     st.error(f"Could not geocode ZIP {zip_to_use}: {e}")
     lat = lon = None
 
-if auto_refresh_enabled:
-    last = st.session_state.get("last_auto_refresh", 0)
-    if time.time() - last >= refresh_minutes * 60:
-        st.session_state["last_auto_refresh"] = time.time()
-        safe_rerun()
-
-weather_obj   = None
-weather_error = None
-if lat is not None and lon is not None:
-    try:
-        weather_obj = get_nws_forecast_cached(lat, lon)
-    except Exception as e:
-        weather_error = str(e)
-
 NUM_HOURLY_TO_SHOW = 6
+
 
 def get_hourly_slice(hourly_periods, now_user, user_tz):
     parsed = []
     for h in hourly_periods:
         dt = parse_iso_to_dt(h.get("startTime"))
-        if dt: parsed.append((to_user_tz(dt, user_tz), h))
+        if dt:
+            parsed.append((to_user_tz(dt, user_tz), h))
     parsed.sort(key=lambda x: x[0])
-    idx = 0
-    for i, (dt_user, h) in enumerate(parsed):
-        if dt_user > now_user:
-            idx = i; break
-    return parsed[idx: idx + NUM_HOURLY_TO_SHOW]
+    if not parsed:
+        return []
+    # Most recently STARTED forecast period is the current period.
+    idx = next((i for i in range(len(parsed)-1, -1, -1)
+                if parsed[i][0] <= now_user), 0)
+    return parsed[idx:idx+NUM_HOURLY_TO_SHOW]
 
 def extract_pop(period):
     for key in ("probabilityOfPrecipitation", "pop", "probability"):
@@ -726,65 +857,86 @@ def compute_feels_like_for_period(period, to_celsius_flag):
 
 
 
-# ---------- Unified weather panel (native Streamlit HTML, no iframe) ----------
-from html import escape as _html_escape
-st.markdown('<div class="section-heading">Weather Forecast - ZIP {}</div>'.format(_html_escape(str(zip_to_use))), unsafe_allow_html=True)
-if weather_obj:
-    now_user = to_user_tz(now_utc(), USER_TZ)
-    hourly = (weather_obj.get("forecastHourly") or {}).get("properties", {}).get("periods", [])
-    dayparts = (weather_obj.get("forecast") or {}).get("properties", {}).get("periods", [])
-    items = get_hourly_slice(hourly or dayparts, now_user, USER_TZ)
-    hourly_cards = []
-    for dt_user, it in items:
-        label = "Now" if -300 <= (dt_user-now_user).total_seconds() < 3600 else format_time_short(dt_user)
-        temp_disp = convert_temp_for_display(it.get("temperature"), it.get("temperatureUnit", "F"), use_celsius)
-        feels = compute_feels_like_for_period(it, use_celsius)
-        pop = extract_pop(it)
-        icon_url = _html_escape(it.get("icon") or "", quote=True)
-        icon = '<img src="{}" alt="Weather">'.format(icon_url) if icon_url else ""
-        unit = "C" if use_celsius else "F"
-        extras = []
-        if feels is not None and feels != temp_disp: extras.append("Feels {}&deg;".format(feels))
-        if pop is not None: extras.append("POP {}%".format(pop))
-        hourly_cards.append('<div class="weather-card"><div class="when">{}</div>{}<div class="temp">{}&deg;{}</div><div class="sub">{}</div></div>'.format(_html_escape(label),icon,temp_disp if temp_disp is not None else "--",unit,"<br>".join(extras)))
-    buckets = {}
-    for period in dayparts:
-        dt = parse_iso_to_dt(period.get("startTime") or period.get("endTime") or "")
-        if dt:
-            day = to_user_tz(dt, USER_TZ).date()
-            buckets.setdefault(day, []).append(period)
-    today_local = now_user.date()
-    daily_cards = []
-    for day in [d for d in sorted(buckets) if d >= today_local][:5]:
-        group = buckets[day]
-        icon_url = next((p.get("icon") for p in group if p.get("isDaytime") and p.get("icon")), None)
-        if not icon_url: icon_url = next((p.get("icon") for p in group if p.get("icon")), "")
-        icon = '<img src="{}" alt="Forecast">'.format(_html_escape(icon_url, quote=True)) if icon_url else ""
-        values = [convert_temp_for_display(p.get("temperature"),p.get("temperatureUnit","F"),use_celsius) for p in group]
-        values = [v for v in values if v is not None]
-        high, low = (max(values),min(values)) if values else ("--","--")
-        common = next((p.get("shortForecast") for p in group if p.get("isDaytime") and p.get("shortForecast")), "")
-        if not common: common = next((p.get("shortForecast") for p in group if p.get("shortForecast")), "")
-        unit = "C" if use_celsius else "F"
-        daily_cards.append('<div class="weather-card"><div class="when">{}</div>{}<div class="temp">{}&deg; / {}&deg;{}</div><div class="sub">{}</div></div>'.format(day.strftime("%a"),icon,high,low,unit,_html_escape(common[:32])))
-    weather_html = ('<div class="weather-panel"><div class="weather-two">'
-        '<div><div class="forecast-title">Next 6 hours</div><div class="weather-grid">{}</div></div>'
-        '<div><div class="forecast-title">5-day outlook</div><div class="weather-grid daily">{}</div></div>'
-        '</div></div>').format("".join(hourly_cards),"".join(daily_cards))
-    st.markdown(weather_html, unsafe_allow_html=True)
-else:
-    st.info("No forecast available.")
+# Browser-active auto-refresh changes only the weather section, not spa API activity.
+@st.fragment(run_every="5m")
+def render_weather_section():
+    # ---------- Unified weather panel (native Streamlit HTML, no iframe) ----------
+    from html import escape as _html_escape
+    st.markdown('<div class="section-heading">Weather Forecast - ZIP {}</div>'.format(_html_escape(str(zip_to_use))), unsafe_allow_html=True)
+    weather_obj = None
+    if lat is not None and lon is not None:
+        try:
+            weather_obj = get_nws_forecast_cached(lat, lon)
+        except Exception as exc:
+            _event("WEATHER_UPDATE", success=False, error=str(exc))
+    if weather_obj:
+        now_user = to_user_tz(now_utc(), USER_TZ)
+        hourly = (weather_obj.get("forecastHourly") or {}).get("properties", {}).get("periods", [])
+        dayparts = (weather_obj.get("forecast") or {}).get("properties", {}).get("periods", [])
+        items = get_hourly_slice(hourly or dayparts, now_user, USER_TZ)
+        hourly_cards = []
+        for dt_user, it in items:
+            label = "Now" if dt_user <= now_user else format_time_short(dt_user)
+            temp_disp = convert_temp_for_display(it.get("temperature"), it.get("temperatureUnit", "F"), use_celsius)
+            feels = compute_feels_like_for_period(it, use_celsius)
+            pop = extract_pop(it)
+            icon_url = _html_escape(it.get("icon") or "", quote=True)
+            icon = '<img src="{}" alt="Weather">'.format(icon_url) if icon_url else ""
+            unit = "C" if use_celsius else "F"
+            extras = []
+            if feels is not None and feels != temp_disp: extras.append("Feels {}&deg;".format(feels))
+            if pop is not None: extras.append("POP {}%".format(pop))
+            hourly_cards.append('<div class="weather-card"><div class="when">{}</div>{}<div class="temp">{}&deg;{}</div><div class="sub">{}</div></div>'.format(_html_escape(label),icon,temp_disp if temp_disp is not None else "--",unit,"<br>".join(extras)))
+        buckets = {}
+        for period in dayparts:
+            dt = parse_iso_to_dt(period.get("startTime") or period.get("endTime") or "")
+            if dt:
+                day = to_user_tz(dt, USER_TZ).date()
+                buckets.setdefault(day, []).append(period)
+        today_local = now_user.date()
+        daily_cards = []
+        for day in [d for d in sorted(buckets) if d >= today_local][:5]:
+            group = buckets[day]
+            icon_url = next((p.get("icon") for p in group if p.get("isDaytime") and p.get("icon")), None)
+            if not icon_url: icon_url = next((p.get("icon") for p in group if p.get("icon")), "")
+            icon = '<img src="{}" alt="Forecast">'.format(_html_escape(icon_url, quote=True)) if icon_url else ""
+            values = [convert_temp_for_display(p.get("temperature"),p.get("temperatureUnit","F"),use_celsius) for p in group]
+            values = [v for v in values if v is not None]
+            high, low = (max(values),min(values)) if values else ("--","--")
+            common = next((p.get("shortForecast") for p in group if p.get("isDaytime") and p.get("shortForecast")), "")
+            if not common: common = next((p.get("shortForecast") for p in group if p.get("shortForecast")), "")
+            unit = "C" if use_celsius else "F"
+            daily_cards.append('<div class="weather-card"><div class="when">{}</div>{}<div class="temp">{}&deg; / {}&deg;{}</div><div class="sub">{}</div></div>'.format(day.strftime("%a"),icon,high,low,unit,_html_escape(common[:32])))
+        weather_html = ('<div class="weather-panel"><div class="weather-two">'
+            '<div><div class="forecast-title">Next 6 hours</div><div class="weather-grid">{}</div></div>'
+            '<div><div class="forecast-title">5-day outlook</div><div class="weather-grid daily">{}</div></div>'
+            '</div></div>').format("".join(hourly_cards),"".join(daily_cards))
+        st.markdown(weather_html, unsafe_allow_html=True)
+        st.caption("NWS forecast checked " + _local_timestamp(weather_obj.get("fetched_at")))
+    else:
+        st.info("No forecast available.")
+
+
+render_weather_section()
 
 # ============================================================
 # Arctic Spa Status Card
 # ============================================================
 st.markdown('<div class="section-heading spa">Monisha\'s Bath Tub</div>', unsafe_allow_html=True)
-spa_result = fetch_spa_status_via_service()
+spa_result = get_spa_status_throttled()
+_sync_pump_session(USER_TZ)
+_sync_chem_session(USER_TZ)
+if spa_result.get("checked_at"):
+    detail = "Spa last checked " + _local_timestamp(spa_result["checked_at"])
+    if spa_result.get("stale"):
+        detail += " - cached reading; latest API check failed"
+    st.caption(detail)
+
 
 
 
 if not spa_result.get("ok"):
-    st.info("🛁 Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
+    st.info("ðŸ› Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
 else:
     try:
         spa_test  # noqa: F821
@@ -816,8 +968,6 @@ else:
     spaboy_producing   = spa.get("spaboy_producing")
     errors             = spa.get("errors") or []
 
-    # ---- Update pump runtimes ----
-    update_pump_runtimes({1: pump1, 2: pump2, 3: pump3}, USER_TZ)
 
     # ---- Alert logic ----
     def _is_error_status(val):
@@ -859,9 +1009,6 @@ else:
         if orp_val < ORP_MIN:  other_not_ok = True; reasons.append(f"ORP too low: {orp_val:.0f} mV")
         elif orp_val > ORP_MAX: other_not_ok = True; reasons.append(f"ORP too high: {orp_val:.0f} mV")
 
-    # ---- FIX: Update persistent chem ranges (survives refresh) ----
-    update_chem_ranges_persistent(temp_val, ph_val, orp_val, USER_TZ)
-    _sync_chem_session(USER_TZ)  # copy into session_state for display
 
     if errors:
         other_not_ok = True; reasons.append(f"spa errors: {errors}")
@@ -875,60 +1022,26 @@ else:
                            and temp_val < (setpoint_val - 4.0))
     trigger_alert = other_not_ok or temp_below_setpoint
 
-    temp_reset_result = None
-    if temp_below_setpoint:
-        spa_id = spa.get("id") or spa.get("spa_id") or spa.get("spaId") or ""
-        if spa_id and setpoint_val is not None:
-            setpoint_c = (setpoint_val - 32.0) * 5.0 / 9.0
-            try:    temp_reset_result = _call_temperature_set(spa_id, setpoint_c)
-            except Exception as exc: temp_reset_result = {"ok": False, "error": str(exc)}
-        else:
-            temp_reset_result = {"ok": False, "error": "spa_id or setpoint not available"}
-
-    alert_sent_recently = False
-    if "last_spa_alert" in st.session_state:
-        try:
-            if time.time() - float(st.session_state["last_spa_alert"]) < 14400: #was 3600 changed to 14400
-                alert_sent_recently = True
-        except: pass
-
-    if trigger_alert and not alert_sent_recently:
-        ts = datetime.now(timezone.utc).astimezone(USER_TZ).strftime("%Y-%m-%d %H:%M %Z")
-        alert_title  = "Spa Alert: Monisha's Tub"
-        trigger_desc = f"temp {temp_val}F is >4F below setpoint {setpoint_val}F" if temp_below_setpoint else "health indicator"
-        reset_line   = ""
-        if temp_reset_result is not None:
-            reset_line = f"Action: setpoint re-applied ({setpoint_val} F)" if temp_reset_result.get("ok") else f"Action: failed to re-apply — {temp_reset_result.get('error')}"
-        p1_rt = get_pump_runtime_display(1)
-        p2_rt = get_pump_runtime_display(2)
-        p3_rt = get_pump_runtime_display(3)
-        message_lines = [
-            f"Time: {ts}",
-            f"Temp: {temp_val if temp_val is not None else 'N/A'} F  |  Setpoint: {setpoint_val or 'N/A'} F",
-            f"Trigger: {trigger_desc}",
-            *(([reset_line]) if reset_line else []),
-            f"Issues: {', '.join(reasons) if reasons else 'none'}",
-            f"Conn: {'OK' if connected else 'DISCONNECTED'}  P1:{pump1} ({p1_rt}) P2:{pump2} ({p2_rt}) P3:{pump3} ({p3_rt})",
-            f"Filter: {filter_status}  |  pH: {ph} ({ph_status})  |  ORP: {orp} ({orp_status})",
-            f"Errors: {errors or 'none'}",
-        ]
-        try:
-            send_ntfy_message(NTFY_TOPIC, alert_title, "\n".join(message_lines),
-                              server=NTFY_SERVER, priority="urgent", tags="warning,bathtub")
-            st.success(f"📲 Push alert sent to ntfy topic: `{NTFY_TOPIC}`")
-            st.session_state["last_spa_alert"] = time.time()
-        except Exception as exc:
-            st.error(f"Failed to send ntfy alert: {exc}")
-        if temp_reset_result is not None:
-            if temp_reset_result.get("ok"): st.success(f"Setpoint re-applied: {setpoint_val} F")
-            else:                            st.warning(f"Could not re-apply setpoint: {temp_reset_result.get('error')}")
-    elif trigger_alert and alert_sent_recently:
-        st.info("⚠️ Alert condition present but rate-limited (1/hr).")
+    # Side effects are processed once per new successful sample, not once per
+    # browser visit or Streamlit rerun. Four-hour cooldown is server-shared.
+    effects = process_new_spa_observation(
+        spa, spa_result.get("checked_at"), trigger_alert=trigger_alert,
+        reasons=reasons, temp_below_setpoint=temp_below_setpoint,
+        temp_val=temp_val, setpoint_val=setpoint_val,
+        ph_val=ph_val, orp_val=orp_val, connected=connected,
+        filter_status=filter_status, ph_status=ph_status,
+        orp_status=orp_status, errors=errors)
+    if effects.get("notification") == "failed":
+        st.warning("Spa alert notification failed; see operational events in Settings.")
+    if effects.get("setpoint") and not effects["setpoint"].get("ok"):
+        st.warning("Automatic setpoint reapplication failed; see operational events.")
+    _sync_pump_session(USER_TZ)
+    _sync_chem_session(USER_TZ)
 
     # ---- Build spa card HTML ----
     if trigger_alert:
-        problems_str = " · ".join(reasons) if reasons else "temp below setpoint"
-        alert_banner = f'<div class="alert-banner">⚠️ Alert condition detected — {problems_str}</div>'
+        problems_str = " Â· ".join(reasons) if reasons else "temp below setpoint"
+        alert_banner = f'<div class="alert-banner">âš ï¸ Alert condition detected â€” {problems_str}</div>'
     else:
         alert_banner = ""
 
@@ -955,7 +1068,7 @@ else:
     if spaboy_connected is not None:
         sb_cls   = "spa-badge-ok" if spaboy_connected else "spa-badge-off"
         sp_label = "SpaBoy " + ("connected" if spaboy_connected else "disconnected")
-        if spaboy_producing: sp_label += " · producing"
+        if spaboy_producing: sp_label += " Â· producing"
         spaboy_html = f'<span class="spa-badge {sb_cls}">{sp_label}</span>'
 
     lights_cls = badge_class(lights)
@@ -963,10 +1076,10 @@ else:
 
     errors_html = ""
     if errors:
-        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">⚠ {e}</div>' for e in errors)
+        err_items   = "".join(f'<div style="color:#ff8080;font-size:0.85rem;margin-top:4px">âš  {e}</div>' for e in errors)
         errors_html = f'<hr class="spa-divider"><div class="spa-section-label">Errors / Alerts</div>{err_items}'
     else:
-        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">✅ No active errors</div>'
+        errors_html = '<hr class="spa-divider"><div style="color:#6effa8;font-size:0.85rem">âœ… No active errors</div>'
 
     filtration_html = ""
     if filtration_frequency or filtration_duration:
@@ -975,7 +1088,7 @@ else:
     def pump_inline(n, pval):
         rt    = get_pump_runtime_display(n)
         is_on = _is_pump_on(pval)
-        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"●" if is_on else "○"}</span>'
+        dot   = f'<span style="color:{"#6effa8" if is_on else "#666"};font-size:0.7rem">{"â—" if is_on else "â—‹"}</span>'
         st_lbl = str(pval or "off")
         return (f'<span style="color:#a0c8e8;font-size:0.82rem">P{n}</span> {dot} '
                 f'<span style="font-size:0.82rem;color:#ccc">{st_lbl}</span> '
@@ -985,7 +1098,7 @@ else:
     p2_html = pump_inline(2, pump2)
     p3_html = pump_inline(3, pump3)
 
-    temp_html = chem_inline_html("Temp", temp_val, "°F", TEMP_MIN_F, TEMP_MAX_F,
+    temp_html = chem_inline_html("Temp", temp_val, "Â°F", TEMP_MIN_F, TEMP_MAX_F,
                                  st.session_state.get("chem_min_temp"),
                                  st.session_state.get("chem_max_temp"), fmt=".1f")
     ph_html   = chem_inline_html("pH", ph_val, "", PH_MIN, PH_MAX,
@@ -998,23 +1111,23 @@ else:
     # Three-column light panel. All spa measurements remain on the main page.
     # Use the existing HTML component on Streamlit 1.65 for older Tizen compatibility.
     def _display(value, suffix=""):
-        return f"{value}{suffix}" if value is not None else "—"
+        return f"{value}{suffix}" if value is not None else "â€”"
 
     def _chem_row(label, value, lo, hi, unit, minimum, maximum, fmt):
         if value is None:
-            status, shown = "Unavailable", "—"
+            status, shown = "Unavailable", "â€”"
             status_cls = "neutral"
         else:
             status_cls = "ok" if lo <= value <= hi else "bad"
             status = "OK" if status_cls == "ok" else "Check"
             shown = f"{value:{fmt}}{unit}"
-        day = (f"{minimum:{fmt}}–{maximum:{fmt}}" if minimum is not None and maximum is not None else "—")
+        day = (f"{minimum:{fmt}}â€“{maximum:{fmt}}" if minimum is not None and maximum is not None else "â€”")
         return (f'<div class="chem-row"><span>{label}</span><strong>{shown}</strong>'
                 f'<span class="status {status_cls}">{status}</span>'
                 f'<small>Today {day}</small></div>')
 
     chem_rows = "".join([
-        _chem_row("Temp", temp_val, TEMP_MIN_F, TEMP_MAX_F, "°F",
+        _chem_row("Temp", temp_val, TEMP_MIN_F, TEMP_MAX_F, "Â°F",
                   st.session_state.get("chem_min_temp"), st.session_state.get("chem_max_temp"), ".1f"),
         _chem_row("pH", ph_val, PH_MIN, PH_MAX, "",
                   st.session_state.get("chem_min_ph"), st.session_state.get("chem_max_ph"), ".2f"),
@@ -1026,15 +1139,15 @@ else:
     temp_class = "bad" if temp_below_setpoint else "ok" if temp_val is not None else "neutral"
     spa_boy_status = ("Producing" if spaboy_producing else "Connected" if spaboy_connected else "Disconnected") if spaboy_connected is not None else "Unknown"
     pumps_html = "".join(
-        f'<div class="pump-row"><strong>P{n}</strong><span>{_display(v)}</span><small>{get_pump_runtime_display(n)} today</small></div>'
+        f'<div class="pump-row"><strong>P{n}</strong><span>{_display(v)}</span><small>{get_pump_runtime_display(n)} today (est.)</small></div>'
         for n, v in ((1, pump1), (2, pump2), (3, pump3))
     )
-    filtration_detail = (f" · {filtration_frequency or '?'}×/day · {filtration_duration or '?'} min"
+    filtration_detail = (f" Â· {filtration_frequency or '?'}Ã—/day Â· {filtration_duration or '?'} min"
                          if filtration_frequency or filtration_duration else "")
-    issue_html = (f'<div class="issues">⚠ {problems_str}</div>' if trigger_alert else
+    issue_html = (f'<div class="issues">âš  {problems_str}</div>' if trigger_alert else
                   '<div class="no-issues">No active alerts</div>')
     if errors:
-        issue_html += '<div class="issues">' + ' · '.join(str(e) for e in errors) + '</div>'
+        issue_html += '<div class="issues">' + ' Â· '.join(str(e) for e in errors) + '</div>'
 
     spa_card_html = f"""
     <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1063,23 +1176,24 @@ else:
       border-left:0;border-top:1px solid #dce2e8;padding-top:8px;margin-top:7px}}}}
     </style></head><body><div class="spa-card"><div class="three">
       <div class="col"><div class="subhead">WATER TEMPERATURE</div>
-        <div class="temperature {temp_class}">{_display(temp, ' °F')}</div>
-        <div class="setpoint">Setpoint: <strong>{_display(setpoint, ' °F')}</strong></div>
+        <div class="temperature {temp_class}">{_display(temp, ' Â°F')}</div>
+        <div class="setpoint">Setpoint: <strong>{_display(setpoint, ' Â°F')}</strong></div>
         <div class="detail">Connection: <span class="status {conn_class}">{conn_status}</span></div>
         <div class="detail">SpaBoy: {spa_boy_status}</div></div>
       <div class="col"><div class="subhead">PUMPS &amp; EQUIPMENT</div>
         {pumps_html}
         <div class="detail">Lights: <strong>{_display(lights)}</strong></div>
         <div class="detail">Filter: <strong>{_display(filter_status)}</strong>{filtration_detail}</div></div>
-      <div class="col"><div class="subhead">WATER CHEMISTRY · DAILY MIN–MAX</div>
+      <div class="col"><div class="subhead">WATER CHEMISTRY Â· DAILY MINâ€“MAX</div>
         {chem_rows}
-        <div class="detail" style="font-size:10px;color:#64748b">Safe pH {PH_MIN}–{PH_MAX} · ORP {ORP_MIN}–{ORP_MAX} mV</div></div>
+        <div class="detail" style="font-size:10px;color:#64748b">Safe pH {PH_MIN}â€“{PH_MAX} Â· ORP {ORP_MIN}â€“{ORP_MAX} mV</div></div>
     </div>{issue_html}</div></body></html>
     """
     st.components.v1.html(spa_card_html.encode("ascii", "xmlcharrefreplace").decode("ascii"), height=205 if not trigger_alert else 275, scrolling=False)
 
     with st.sidebar.expander("Raw spa payload (debug)"):
         st.json(spa)
+
 
 
 
@@ -1090,18 +1204,23 @@ st.markdown(
     f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">'
     f'Open Solar System (new tab)</a></div>', unsafe_allow_html=True)
 
+with st.sidebar.expander("Operations - last 30 events"):
+    st.caption("Server-local diagnostic history; may reset after deployment/restart.")
+    for line in reversed(_last_events(30)):
+        st.code(line.strip(), language="json")
+
 if st.sidebar.checkbox("Show debug", value=False):
     st.write("config:", config)
     st.write("zip:", zip_to_use)
     st.write("chem_ranges:", config.get("chem_ranges", {}))
     st.write("pump_runtimes (disk):", config.get("pump_runtimes", {}))
-    st.write("last_auto_refresh:", st.session_state.get("last_auto_refresh"))
+    st.write("last spa poll:", _read_ops().get("spa_checked_at"))
+    st.caption("Pump runtimes are sample-based estimates. Short cycles and long offline gaps are not captured.")
     st.write("arcticspas installed:", ARCTICSPAS_INSTALLED)
     st.write("ntfy topic:", NTFY_TOPIC)
     for _n in [1, 2, 3]:
         daily_s  = float(st.session_state.get(f"pump_daily_seconds_{_n}", 0))
-        on_since = st.session_state.get(f"pump_on_since_{_n}")
-        live     = (time.time() - on_since) if on_since else 0
-        total    = daily_s + live
-        st.write(f"pump_{_n}: disk_daily={daily_s:.0f}s  live={live:.0f}s  total={total:.0f}s  "
+        live = 0
+        total = daily_s
+        st.write(f"pump_{_n}: sampled_daily={daily_s:.0f}s  "
                  f"display={get_pump_runtime_display(_n)}  state={st.session_state.get(f'pump_state_{_n}')}")
