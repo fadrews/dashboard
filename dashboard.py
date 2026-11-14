@@ -1,6 +1,7 @@
 # dashboard.py
 """
 Streamlit app (dense mode) with improved hourly forecast behavior and Arctic Spas API integration.
+Compact version
 """
 
 from typing import Optional, Tuple, Dict, Any, List, Sequence
@@ -514,16 +515,22 @@ def chem_inline_html(label, value, unit, safe_lo, safe_hi, day_min, day_max, fmt
 # ============================================================
 # App start
 # ============================================================
-st.set_page_config(layout="wide", page_title="Forecast Dashboard", initial_sidebar_state="expanded")
+st.set_page_config(layout="wide", page_title="Forecast Dashboard", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
+/* Compact dashboard shell; retain readable touch controls in sidebar. */
+section.main > div.block-container { padding: 0.35rem 0.7rem 0.6rem !important; max-width: 100% !important; }
+[data-testid="stVerticalBlock"] { gap: 0.3rem !important; }
+[data-testid="stElementContainer"] { margin-bottom: 0 !important; }
+[data-testid="stHeader"] { height: 2rem !important; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0.5rem !important; }
 h2 { font-size: 1.1rem !important; margin-top: 6px !important; margin-bottom: 6px !important; }
 .stMarkdown p { margin: 6px 0 !important; }
 .block-container > div { padding-top: 6px !important; padding-bottom: 6px !important; }
 .responsive-grid { display: grid; gap: 10px;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0; margin: 0; }
+  align-items: start; width: 100%; box-sizing: border-box; padding: 2px 0; margin: 0; }
 .responsive-card { display:flex; flex-direction:column; align-items:stretch;
   justify-content:flex-start; padding:8px 10px; box-sizing:border-box;
   min-width: 120px; margin-bottom: 4px; }
@@ -534,7 +541,7 @@ h2 { font-size: 1.1rem !important; margin-top: 6px !important; margin-bottom: 6p
   border-radius: 14px; padding: 18px 20px; color: #fff;
   margin-bottom: 10px; box-shadow: 0 4px 18px rgba(0,0,0,0.18); }
 .spa-card .spa-title { font-size: 1.05rem; font-weight: 700; color: #7ecbf7;
-  letter-spacing: 0.03em; margin-bottom: 12px; }
+  letter-spacing: 0.03em; margin-bottom: 3px; }
 .spa-temp-big { font-size: 2.6rem; font-weight: 800; color: #fff; line-height: 1; }
 .spa-temp-sub { font-size: 0.88rem; color: #a0c8e8; margin-top: 4px; }
 .spa-badge { display: inline-block; padding: 4px 10px; border-radius: 20px;
@@ -777,29 +784,29 @@ if weather_obj:
             if temp_disp is not None:
                 if temp_disp < cold_threshold: color = "#1f77b4"
                 elif temp_disp >= hot_threshold: color = "#d62728"
-            img_tag    = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
-            feels_html = f'<div style="font-size:12px;margin-top:6px">Feels: {feels}°{"C" if use_celsius else "F"}</div>' if feels is not None and feels != temp_disp else ""
-            pop_html   = f'<div style="font-size:12px;margin-top:6px">POP: {pop}%</div>' if pop is not None else ""
+            img_tag    = f'<img src="{icon_url}" style="width:44px;height:44px;max-width:100%;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
+            feels_html = f'<div style="font-size:11px;margin-top:2px">Feels: {feels}°{"C" if use_celsius else "F"}</div>' if feels is not None and feels != temp_disp else ""
+            pop_html   = f'<div style="font-size:11px;margin-top:2px">POP: {pop}%</div>' if pop is not None else ""
             card = f'''
-            <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:8px 10px;flex:1;min-width:72px;box-sizing:border-box;">
-              <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:6px">{label}</div>
+            <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:2px 3px;flex:1;min-width:0;box-sizing:border-box;">
+              <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:2px">{label}</div>
               <div style="display:flex;align-items:center;justify-content:center;">{img_tag}</div>
-              <div style="text-align:center;font-weight:700;color:{color};margin-top:8px;font-size:1.02rem">{temp_disp if temp_disp is not None else "N/A"}°{"C" if use_celsius else "F"}</div>
+              <div style="text-align:center;font-weight:700;color:{color};margin-top:2px;font-size:1.02rem">{temp_disp if temp_disp is not None else "N/A"}°{"C" if use_celsius else "F"}</div>
               <div style="text-align:center">{feels_html}{pop_html}</div>
             </div>'''
             cards.append(card)
         cards_html = ''.join(cards)
         st.components.v1.html(f"""
         <style>
-        .responsive-grid {{ display: grid; gap: 10px;
-          grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0; }}
-        @media (max-width: 600px) {{ .responsive-grid {{ grid-template-columns: repeat(3, 1fr); }} }}
+        .responsive-grid {{ display: grid; gap: 3px;
+          grid-template-columns: repeat(6, minmax(0, 1fr));
+          align-items: start; width: 100%; box-sizing: border-box; padding: 2px 0; }}
+        @media (max-width: 650px) {{ .responsive-grid {{ grid-template-columns: repeat(3, 1fr); }} }}
         </style>
-        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">⏱️ Immediate forecast
+        <div style="font-weight:600;font-size:0.95rem;margin-bottom:2px">⏱️ Immediate forecast
           <span style="font-weight:400;font-size:0.88rem;color:#666">— next {NUM_HOURLY_TO_SHOW} hours</span></div>
         <div class="responsive-grid">{cards_html}</div>
-        """, height=220, scrolling=True)
+        """, height=160, scrolling=False)
 else:
     st.info("No forecast available.")
 
@@ -838,39 +845,39 @@ if weather_obj:
                 if td is not None: temps_display.append(td)
             high = max(temps_display) if temps_display else None
             low  = min(temps_display) if temps_display else None
-            img_tag   = f'<img src="{icon_url}" style="max-width:72%;width:auto;height:auto;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
+            img_tag   = f'<img src="{icon_url}" style="width:44px;height:44px;max-width:100%;display:block;margin:0 auto;object-fit:contain"/>' if icon_url else ""
             ft        = "C" if use_celsius else "F"
             low_html  = f'<span style="color:#e05050">{low}°{ft}</span>' if low is not None and ((low < 0 and use_celsius) or (low < 32 and not use_celsius)) else (f"{low}°{ft}" if low is not None else "N/A")
             high_html = f"{high}°{ft}" if high is not None else "N/A"
             short_texts = [p.get("shortForecast","") for p in [it["period"] for it in bucket] if p.get("shortForecast")]
             common    = max(set(short_texts), key=short_texts.count) if short_texts else ""
             card = f'''
-            <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:8px 10px;flex:1;min-width:72px;box-sizing:border-box;">
-              <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:6px">{weekday}</div>
+            <div style="display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;padding:2px 3px;flex:1;min-width:0;box-sizing:border-box;">
+              <div style="text-align:center;font-weight:600;font-size:0.92rem;margin-bottom:2px">{weekday}</div>
               <div style="display:flex;align-items:center;justify-content:center;">{img_tag}</div>
-              <div style="text-align:center;margin-top:8px;font-size:0.98rem">H <strong>{high_html}</strong></div>
+              <div style="text-align:center;margin-top:2px;font-size:0.98rem">H <strong>{high_html}</strong></div>
               <div style="text-align:center;font-size:0.86rem">L {low_html}</div>
-              <div style="text-align:center;font-size:11px;margin-top:6px;color:#444">{(common or '')[:36]}</div>
+              <div style="text-align:center;font-size:10px;margin-top:2px;color:#444">{(common or '')[:36]}</div>
             </div>'''
             cards.append(card)
         cards_html = ''.join(cards)
         st.components.v1.html(f"""
         <style>
-        .responsive-grid {{ display: grid; gap: 10px;
-          grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-          align-items: start; width: 100%; box-sizing: border-box; padding: 6px 0; }}
+        .responsive-grid {{ display: grid; gap: 3px;
+          grid-template-columns: repeat(5, minmax(0, 1fr));
+          align-items: start; width: 100%; box-sizing: border-box; padding: 2px 0; }}
         </style>
-        <div style="font-weight:600;font-size:1.05rem;margin-bottom:6px">📅 5-day forecast
+        <div style="font-weight:600;font-size:0.95rem;margin-bottom:2px">📅 5-day forecast
           <span style="font-weight:400;font-size:0.88rem;color:#666">— daily high / low</span></div>
         <div class="responsive-grid">{cards_html}</div>
-        """, height=260, scrolling=True)
+        """, height=175, scrolling=False)
 
 # ============================================================
 # Arctic Spa Status Card
 # ============================================================
 spa_result = fetch_spa_status_via_service()
 
-st.markdown("<div class='frame' style='background:#f0f4f8;'>", unsafe_allow_html=True)
+
 
 if not spa_result.get("ok"):
     st.info("🛁 Arctic Spas status not available: " + (spa_result.get("error") or "no token / failed request"))
@@ -1088,23 +1095,23 @@ else:
     <style>
     body { margin:0; font-family: sans-serif; }
     .spa-card { background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%);
-      border-radius: 14px; padding: 18px 20px; color: #fff; margin-bottom: 10px;
+      border-radius: 8px; padding: 8px 12px; color: #fff; margin-bottom: 0;
       box-shadow: 0 4px 18px rgba(0,0,0,0.18); }
     .spa-title { font-size: 1.05rem; font-weight: 700; color: #7ecbf7;
-      letter-spacing: 0.03em; margin-bottom: 12px; }
-    .spa-temp-big { font-size: 2.6rem; font-weight: 800; line-height: 1; }
+      letter-spacing: 0.03em; margin-bottom: 3px; }
+    .spa-temp-big { font-size: 2.0rem; font-weight: 800; line-height: 1; }
     .spa-temp-sub { font-size: 0.88rem; color: #a0c8e8; margin-top: 4px; }
-    .spa-badge { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:20px;
-      font-size:0.8rem; font-weight:600; margin:3px 3px 3px 0; }
+    .spa-badge { display:inline-flex; align-items:center; gap:6px; padding:2px 6px; border-radius:12px;
+      font-size:0.8rem; font-weight:600; margin:1px 2px 1px 0; }
     .spa-badge-ok   { background:rgba(40,200,100,0.22);  color:#6effa8; border:1px solid rgba(40,200,100,0.4); }
     .spa-badge-warn { background:rgba(255,160,0,0.22);   color:#ffd060; border:1px solid rgba(255,160,0,0.4); }
     .spa-badge-err  { background:rgba(220,60,60,0.22);   color:#ff8080; border:1px solid rgba(220,60,60,0.4); }
     .spa-badge-off  { background:rgba(120,120,120,0.22); color:#ccc;    border:1px solid rgba(120,120,120,0.3); }
     .spa-section-label { font-size:0.78rem; text-transform:uppercase; letter-spacing:0.07em;
-      color:#7ecbf7; margin-bottom:5px; margin-top:12px; font-weight:600; }
-    .spa-divider { border:none; border-top:1px solid rgba(255,255,255,0.08); margin:10px 0; }
+      color:#7ecbf7; margin-bottom:5px; margin-top:4px; font-weight:600; }
+    .spa-divider { border:none; border-top:1px solid rgba(255,255,255,0.08); margin:4px 0; }
     .alert-banner { background:linear-gradient(90deg,#7b1a1a,#b02020); border-radius:8px;
-      padding:10px 14px; color:#fff; font-weight:600; margin-bottom:10px; }
+      padding:4px 8px; color:#fff; font-weight:600; margin-bottom:4px; }
     /* Connection dot */
     .conn-dot { display:inline-block; width:10px; height:10px; border-radius:50%; flex-shrink:0; }
     .conn-dot-ok  { background:#3ddc84; box-shadow:0 0 6px #3ddc84; }
@@ -1121,7 +1128,7 @@ else:
       {alert_banner}
       <div class="spa-title">🛁 Monisha's Tub — Live Status</div>
 
-      <div style="display:flex;align-items:flex-end;gap:24px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;">
         <div>
           <div class="spa-temp-big" style="color:{temp_color}">{temp if temp is not None else "—"} °F</div>
           <div class="spa-temp-sub">Setpoint: {setpoint or "—"} °F</div>
@@ -1134,13 +1141,13 @@ else:
 
       <hr class="spa-divider">
 
-      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;line-height:1.8">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;line-height:1.3">
         {temp_html} &nbsp;·&nbsp; {ph_html} &nbsp;·&nbsp; {orp_html}
       </div>
 
       <hr class="spa-divider">
 
-      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;line-height:1.8">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;line-height:1.3">
         {p1_html} &nbsp;·&nbsp; {p2_html} &nbsp;·&nbsp; {p3_html}
       </div>
       <div style="font-size:0.7rem;color:#3a5a70;margin-top:2px">runtime today · resets midnight</div>
@@ -1155,25 +1162,25 @@ else:
     </div>
     """
 
-    st.components.v1.html(inline_styles + spa_card_html, height=360, scrolling=False)
+    st.components.v1.html(inline_styles + spa_card_html, height=245, scrolling=False)
 
     with st.expander("Raw spa payload (debug)"):
         st.json(spa)
 
-st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------- Enphase iframe ----------
-st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-st.markdown("## ☀️ Enphase Solar Panels")
-try:
-    st.components.v1.iframe(ENPHASE_PUBLIC_URL, height=540)
-except Exception:
-    st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase hour graph (public)</a>', unsafe_allow_html=True)
-st.markdown(f'If embedding is blocked: <a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open in new tab</a>', unsafe_allow_html=True)
 
-st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-st.caption("Compact layout · Hourly starts at next full hour · First shown hour labeled 'Now' · Feels-like, POP & color-coded temps · Pump runtime tracked in-session · Chemistry ranges persisted to disk · Alerts via ntfy.sh")
-if st.checkbox("Show debug"):
+# ---------- Solar panel: available on demand without reserving 540px ----------
+with st.expander("☀️ Enphase solar panels — open graph", expanded=False):
+    try:
+        st.components.v1.iframe(ENPHASE_PUBLIC_URL, height=380)
+    except Exception:
+        st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open Enphase graph</a>', unsafe_allow_html=True)
+    st.markdown(f'<a href="{ENPHASE_PUBLIC_URL}" target="_blank" rel="noopener noreferrer">Open full graph in new tab</a>', unsafe_allow_html=True)
+
+with st.expander("Dashboard information / diagnostics", expanded=False):
+    st.caption("Hourly forecast · Feels-like · POP · Pump runtimes · Daily chemistry ranges · ntfy alerts")
+
+if st.checkbox("Show debug", value=False):
     st.write("config:", config)
     st.write("zip:", zip_to_use)
     st.write("chem_ranges:", config.get("chem_ranges", {}))
